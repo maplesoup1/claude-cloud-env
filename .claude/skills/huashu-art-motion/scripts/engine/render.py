@@ -14,6 +14,7 @@ import argparse, base64, http.server, json, socketserver, subprocess, sys, threa
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import spec_assets
+from launch import launch_chromium
 from playwright.sync_api import sync_playwright
 
 ap = argparse.ArgumentParser()
@@ -27,6 +28,8 @@ ap.add_argument('--solo', help='只渲某个时代（时间为本段局部时间
 ap.add_argument('--film', default='', help='片子名：读 eras_<名>.js（默认 eras.js）')
 ap.add_argument('--no-counter', action='store_true', help='--solo 时不画角标')
 ap.add_argument('--crf', type=int, default=14)
+ap.add_argument('--jpeg', nargs='?', type=float, const=0.95, default=None, metavar='Q',
+                help='帧从浏览器传出来用 JPEG（质量 Q，默认 0.95）而不是 PNG：每帧省 100–150ms，长片用；--alpha 和 --stills 不受影响')
 ap.add_argument('--spec', help='参数化片段 spec.json（走 clip.html，不读段落表）')
 ap.add_argument('--alpha', action='store_true', help='--spec 时出 ProRes 4444 带透明（背景不画）')
 ap.add_argument('--width', type=int, help='整片模式的画布宽（竖屏 1080）；--spec 时宽高从 spec 读，写了这个会覆盖 spec')
@@ -90,7 +93,7 @@ port = srv.server_address[1]
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 with sync_playwright() as p:
-    b = p.chromium.launch(args=['--disable-web-security', '--enable-gpu-rasterization', '--ignore-gpu-blocklist'])
+    b = launch_chromium(p, ['--disable-web-security', '--enable-gpu-rasterization', '--ignore-gpu-blocklist'])
     pg = b.new_page(viewport={'width': 1920, 'height': 1080}, device_scale_factor=1)
     errors = []
     def on_console(m):
@@ -113,7 +116,10 @@ with sync_playwright() as p:
     if bf: raise SystemExit('场景加载失败，拒绝渲染：\n' + bf)
     if a.t1 is None: a.t1 = pg.evaluate('window.__total')
     if spec: a.fps = spec.get('fps', 30); a.t0 = 0; a.t1 = spec['duration']
-    grab = '''async (t)=>{ await window.prepare(t); window.renderFrame(t); return window.__canvas.toDataURL('image/png').split(',')[1]; }'''
+    # 出视频时帧格式：PNG 无损；--jpeg 有损但每帧快 100–150ms（成片还要过一道 x264，肉眼看不出差别）。静帧和带透明的片段永远 PNG。
+    fmt = 'png' if (a.jpeg is None or a.stills or (spec and a.alpha)) else 'jpeg'
+    enc_js = "'image/png'" if fmt == 'png' else f"'image/jpeg', {a.jpeg}"
+    grab = '''async (t)=>{ await window.prepare(t); window.renderFrame(t); return window.__canvas.toDataURL(%s).split(',')[1]; }''' % enc_js
 
     if a.audit:
         if not spec: raise SystemExit('--audit 只配 --spec')
@@ -123,7 +129,7 @@ with sync_playwright() as p:
         b.close(); srv.shutdown(); srv.server_close()
         sys.exit(1 if rep['red'] else 0)
     if a.solo:
-        grab = '''async (t)=>{ window.renderSolo(%s, t, {counter: %s}); return window.__canvas.toDataURL('image/png').split(',')[1]; }''' % (repr(a.solo), 'false' if a.no_counter else 'true')
+        grab = '''async (t)=>{ window.renderSolo(%s, t, {counter: %s}); return window.__canvas.toDataURL(%s).split(',')[1]; }''' % (repr(a.solo), 'false' if a.no_counter else 'true', enc_js)
     if a.stills:
         out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
         for s in a.stills.split(','):
@@ -136,7 +142,7 @@ with sync_playwright() as p:
               ['-c:v', 'libx264', '-preset', 'slow', '-crf', str(a.crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart'] + \
               (['-g', str(a.fps), '-keyint_min', str(a.fps), '-sc_threshold', '0'] if spec else [])   # 片段要被管线的渲染器按秒 seek：每秒一个关键帧，否则冻帧
         if spec and a.alpha and not vid.endswith('.mov'): print('提示：ProRes 4444 一般用 .mov 容器')
-        ff = subprocess.Popen(['ffmpeg', '-y', '-v', 'error', '-f', 'image2pipe', '-framerate', str(a.fps), '-c:v', 'png', '-i', '-'] + enc + [vid],
+        ff = subprocess.Popen(['ffmpeg', '-y', '-v', 'error', '-f', 'image2pipe', '-framerate', str(a.fps), '-c:v', 'mjpeg' if fmt == 'jpeg' else 'png', '-i', '-'] + enc + [vid],
                               stdin=subprocess.PIPE)
         n0, n1 = round(a.t0 * a.fps), round(a.t1 * a.fps)
         st = time.time()

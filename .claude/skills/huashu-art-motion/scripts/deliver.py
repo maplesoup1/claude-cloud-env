@@ -5,7 +5,7 @@
 """deliver.py —— 一条命令交付：量门禁 → 红灯不出片；绿灯、黄灯复制成片并写交付说明，说明里的事实由脚本写。
 
     uv run deliver.py <成片.mp4> --out output/ [--spec 片段.json | --project <代码工程>] [--qa <qa 输出目录>] [--root <项目目录>]
-                      [--sub-band 0.15] [--vertical auto|yes|no] [--allow-blue-purple "理由"]
+                      [--sub-band 0.15] [--vertical auto|yes|no] [--allow-blue-purple "理由"] [--parts 章节.json]
     uv run deliver.py --verify output/交付说明.md       # 核对事实段有没有被改过
 
 做三件事：
@@ -21,6 +21,8 @@
   - qa 输出目录：--qa 优先；否则和 qa.py 的默认一致——--spec → <spec 所在目录>/qa，--project → <代码工程的上一级>/qa。
   - 项目目录：--root 优先；否则 --project 的上一级；否则 --spec 所在目录；否则成片所在目录。
   - 审片人（没参与制作的 agent 或人）把结论写成 <项目目录>/审片/<任意名>.md。脚本只看文件在不在，不读内容，不替审片人下结论。
+  - 长片（超过 8 分钟或给了 --parts）：film_gate 分段量，交付说明多一张逐段表；审片记录少于 2 份时事实段会写明
+    （references/17-长片.md：长片至少两位审片人，按章节分工）。long_film.py deliver 会自动带上 --parts。
 """
 from __future__ import annotations
 
@@ -100,13 +102,16 @@ def qa_facts(qa_dir, spec):
     return L
 
 
-def review_facts(root):
+def review_facts(root, long_film=False):
     d = root / "审片"
     files = sorted(p.name for p in d.glob("*.md")) if d.is_dir() else []
     if not files:
         return [f"- 没派审片（`{d}` 下没有 .md 文件）"]
-    return [f"- 有 {len(files)} 份审片记录（`{d}`）：" + "、".join(files),
-            "- 脚本只确认文件存在，没有读内容；审片结论以文件本身为准"]
+    L = [f"- 有 {len(files)} 份审片记录（`{d}`）：" + "、".join(files),
+         "- 脚本只确认文件存在，没有读内容；审片结论以文件本身为准"]
+    if long_film and len(files) < 2:
+        L.append("- 长片只有 1 份审片记录（长片至少两位审片人，见 references/17-长片.md）")
+    return L
 
 
 def facts_block(src, dst, info, res, rows, qa_lines, rv_lines):
@@ -127,6 +132,8 @@ def facts_block(src, dst, info, res, rows, qa_lines, rv_lines):
         L.append(f"- 最差 {w['end_s'] - w['start_s']:.0f} 秒窗口：{w['start_s']:.0f}–{w['end_s']:.0f}s，快动帧占比 {w['fast_ratio']}")
     if ex["fix"]:
         L.append(f"- 怎么改：{ex['fix']}")
+    if res.get("parts"):
+        L += ["", "逐段（长片模式）：", ""] + ["- " + ln.strip() for ln in film_gate.part_lines(res)[1:]]
     L += ["", "| 灯 | 类型 | 指标 | 值 |", "|---|---|---|---|"]
     for k, name, v, lv, gate, unit in rows:
         vs = "—" if v is None else (f"{v:.3f}" if isinstance(v, float) else str(v))
@@ -140,6 +147,9 @@ def write_doc(out, dst, facts, res):
     look = [t for _, t in res["explain"]["look"]]
     if res["lights"]["fast_ratio"] == "yellow":
         look.insert(0, f"门禁黄灯：快速运动帧占比 {res['fast_ratio']}（黄线 0.06）")
+    if res["lights"].get("fast_ratio_worst_part") == "yellow":
+        p = min(res["parts"], key=lambda x: x["fast_ratio"])
+        look.insert(0, f"门禁黄灯：第 {p['index']} 段（{p['label'] or film_gate.fmt_ts(p['start_s']) + ' 起'}）快动帧占比 {p['fast_ratio']}（黄线 0.06）")
     tail = ["## 制作说明（制作者填写；只写在这一段，事实段不要动）", "",
             "- 用了哪个语法 / 风格：",
             "- 「六种做坏方式」逐条自查：",
@@ -175,6 +185,7 @@ def main():
     ap.add_argument("--verify", metavar="交付说明.md", help="只核对事实段有没有被改过")
     ap.add_argument("--allow-blue-purple", metavar="理由", default=None,
                     help="同 film_gate.py：题材本身要蓝紫时写理由，理由写进交付说明事实段")
+    ap.add_argument("--parts", metavar="章节.json", default=None, help="同 film_gate.py：长片按章节分段量")
     a = ap.parse_args()
     if a.verify:
         sys.exit(verify(a.verify))
@@ -192,8 +203,9 @@ def main():
 
     try:
         info = probe(src)
-        res, rows = film_gate.measure(str(src), sub_band=a.sub_band, vertical=a.vertical, allow_blue_purple=a.allow_blue_purple)
-    except (subprocess.CalledProcessError, StopIteration, KeyError, RuntimeError, ValueError) as e:
+        res, rows = film_gate.measure(str(src), sub_band=a.sub_band, vertical=a.vertical, allow_blue_purple=a.allow_blue_purple,
+                                      parts=a.parts)
+    except (subprocess.CalledProcessError, StopIteration, KeyError, RuntimeError, ValueError, OSError) as e:
         print(f"读不了这支片：{src}（{e}）", file=sys.stderr); sys.exit(1)
     print("\n".join(film_gate.report_lines(res, rows)))
     ex = res["explain"]
@@ -208,7 +220,7 @@ def main():
     dst = out / src.name
     if dst != src:
         shutil.copy2(src, dst)
-    qa_lines, rv_lines = qa_facts(qa_dir, spec), review_facts(root)
+    qa_lines, rv_lines = qa_facts(qa_dir, spec), review_facts(root, long_film=bool(res.get("parts")))
     facts = facts_block(src, dst, info, res, rows, qa_lines, rv_lines)
     doc = write_doc(out, dst, facts, res)
     gl = res["gate_light"]

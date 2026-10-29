@@ -39,6 +39,7 @@ import argparse, base64, functools, http.server, io, json, socketserver, sys, th
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'engine'))
 import spec_assets
+from launch import launch_chromium
 import numpy as np
 from PIL import Image, ImageDraw
 from playwright.sync_api import sync_playwright
@@ -226,7 +227,7 @@ def camera_events(frames, diffs, idx, fps, max_s=2.0):
 report = {'project': str(root), 'spec': str(Path(a.spec).resolve()) if a.spec else None, 'segments': []}
 errors = []
 with sync_playwright() as p:
-    br = p.chromium.launch(args=['--enable-gpu-rasterization', '--ignore-gpu-blocklist'])
+    br = launch_chromium(p, ['--enable-gpu-rasterization', '--ignore-gpu-blocklist'])
     pg = br.new_page(viewport={'width': VW, 'height': VH})
     pg.on('pageerror', lambda e: errors.append(str(e)))
     pg.on('console', lambda m: errors.append('console.error: ' + m.text) if m.type == 'error' else None)   # 缺字形等由 console.error 报出

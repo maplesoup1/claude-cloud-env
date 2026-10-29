@@ -6,7 +6,9 @@
 
 用法：
   uv run film_gate.py 成片.mp4 [--json] [--vertical auto|yes|no] [--sub-band 0.15]
-                      [--template 示范片.mp4] [--no-template]
+                      [--template 示范片.mp4] [--no-template] [--parts 章节.json] [-j 4]
+
+长片（超过 8 分钟，或给了 --parts 章节.json）分段多进程量，再合并；另加一条门禁：最差那一段的快动帧占比也要过 0.035。
 
 退出码：红灯 2；黄灯、绿灯 0；读不了文件 1。
 只依赖 ffmpeg/ffprobe 和 opencv，不依赖 art-motion 引擎，任何来源的成片都能量。
@@ -64,6 +66,9 @@ DEFAULT_TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 METRICS = {
     # key: (中文名, 方向, 黄线, 红线, 是否门禁, 单位)
     "fast_ratio":         ("快速运动帧占比", "low_bad", 0.06, 0.035, True, ""),
+    # 长片（分段量）才有：最差那一段（一章或 3 分钟）的快动帧占比。标定集是 45 秒以上的整片，一段 2–4 分钟正好落在标定范围里，
+    # 所以用同一条红线；整片平均会把一整章的翻页 PPT 摊薄掉，20 分钟的片子必须逐段拦。
+    "fast_ratio_worst_part": ("最差分段的快动帧占比（长片）", "low_bad", 0.06, 0.035, True, ""),
     "blank_run_s":        ("中段近乎纯色的空画面（最长连续）", "high_bad", None, 0.3, True, "秒"),
     "blue_purple_share":  ("蓝紫底画面时长占比", "high_bad", 0.12, 0.30, True, ""),
     "fast_ratio_worst_window": ("最差30秒窗口的快动帧占比", "low_bad", 0.02, None, False, ""),
@@ -100,10 +105,10 @@ def probe(path):
     return int(s["width"]), int(s["height"]), float(j["format"].get("duration", 0) or 0)
 
 
-def decode_gray(path, fps=FPS, width=WIDTH, limit=None):
+def decode_gray(path, fps=FPS, width=WIDTH, limit=None, start=0.0):
     W, H, dur = probe(path)
     h = int(round(H * width / W / 2) * 2)
-    cmd = ["ffmpeg", "-v", "error"] + (["-t", str(limit)] if limit else []) + ["-i", path, "-vf",
+    cmd = ["ffmpeg", "-v", "error"] + (["-ss", f"{start:.3f}"] if start else []) + (["-t", str(limit)] if limit else []) + ["-i", path, "-vf",
            f"fps={fps},scale={width}:{h}:flags=area", "-pix_fmt", "gray", "-f", "rawvideo", "-"]
     raw = subprocess.check_output(cmd)
     n = len(raw) // (width * h)
@@ -144,8 +149,8 @@ def to3(M):
 
 
 # ---------------------------------------------------------------- 主分析
-def analyze(path, sub_band=None, vertical="auto", template=None, verbose=False):
-    F, (W0, H0, dur) = decode_gray(path)
+def analyze(path, sub_band=None, vertical="auto", template=None, verbose=False, start=0.0, limit=None):
+    F, (W0, H0, dur) = decode_gray(path, start=start, limit=limit)
     is_vert = (H0 > W0) if vertical == "auto" else (vertical == "yes")
     if sub_band is None:
         sub_band = 0.18 if is_vert else 0.15
@@ -603,11 +608,125 @@ def blue_purple(path, fps=SAMPLE_FPS, width=160):
     return round(float(bad.mean()), 3), spans
 
 
+# ---------------------------------------------------------------- 长片：分段量、合并
+# 20 分钟的片子整片解码进内存要 2–3GB（12fps 灰度帧＋int16 副本），单进程量好几分钟；更要紧的是整片平均会把一整章的翻页 PPT 摊薄。
+# 实测（2026-10-29，6 分钟片）：整片 57 秒、分 3 段 4 核 28 秒，快动帧占比 0.0521 对 0.0516，其余指标一致。
+# 长于 LONG_S 的片子按章节（--parts 章节.json）或每 PART_S 秒切段，多进程分别量，再合并成同样的字段：
+# 比例类按时长加权，计数类相加，「最长/最大」取最大，时间码加上段起点；另加 parts（逐段结果）和 fast_ratio_worst_part（门禁）。
+# 段边界上的一个切点、跨段的静止段会被拆成两半，这是分段的代价；章节边界本来就是硬切，按章节切最准。
+LONG_S = float(os.environ.get("FILM_GATE_LONG_S", 480))
+PART_S = float(os.environ.get("FILM_GATE_PART_S", 180))
+
+WEIGHTED = ["fast_ratio", "top10_share", "drift_ratio", "still_ratio", "dead_bg", "dead_flat", "flat_area", "flat40_frames",
+            "page_frame_share", "slow_zoom_share", "slow_cam_share", "subject_box", "flat_light", "local_fade_ratio", "mean_diff",
+            "event_rate", "template_sim_share"]
+
+
+def fmt_ts(sec):
+    sec = float(sec)
+    return f"{int(sec // 60)}:{sec % 60:04.1f}"
+
+
+def load_parts(spec, dur):
+    """章节表 → [(起, 止, 名)]。spec 可以是 None（每 PART_S 秒一段）、JSON 文件路径（[{"start":0,"end":180,"title":"…"}]
+    或 {"chapters": [...]}，long_film.py assemble 会写这个文件），或已经是列表。"""
+    if spec is None:
+        n = max(1, int(round(dur / PART_S)))
+        step = dur / n
+        return [(round(i * step, 3), round(dur if i == n - 1 else (i + 1) * step, 3), "") for i in range(n)]   # 自动分段没有名字
+    if isinstance(spec, (str, os.PathLike)):
+        with open(spec, encoding="utf-8") as f:
+            spec = json.load(f)
+    if isinstance(spec, dict):
+        spec = spec.get("chapters", [])
+    out = []
+    for i, c in enumerate(spec):
+        a, b = float(c["start"]), float(c["end"])
+        if b > a:
+            out.append((a, min(b, dur) if dur else b, str(c.get("title") or c.get("id") or f"第{i + 1}段")))
+    if not out:
+        raise ValueError("章节表是空的")
+    return out
+
+
+def _analyze_part(args):
+    path, start, end, sub_band, vertical, template = args
+    cv2.setNumThreads(1)
+    return analyze(path, sub_band=sub_band, vertical=vertical, template=template, start=start, limit=end - start)
+
+
+def merge_parts(path, parts, results):
+    """逐段 analyze 的结果 → 一份整片结果（字段和 analyze 一样）。"""
+    secs = np.array([r["duration_s"] for r in results], float)
+    T = float(secs.sum())
+    wavg = lambda k: (round(float(np.average([r[k] for r in results], weights=secs)), 4)
+                      if all(r.get(k) is not None for r in results) else None)
+    shift = lambda lst, a: [round(x + a, 2) for x in lst]
+    res = {"file": os.path.basename(path), "orientation": results[0]["orientation"], "sub_band": results[0]["sub_band"],
+           "duration_s": round(T, 2)}
+    for k in WEIGHTED:
+        res[k] = wavg(k)
+    res["shots"] = sum(r["shots"] for r in results)
+    res["hard_cuts"] = sum(r["hard_cuts"] for r in results)
+    res["dissolves"] = sum(r["dissolves"] for r in results)
+    res["asl_s"] = round(T / max(1, res["shots"]), 2)
+    res["dissolve_share"] = round(res["dissolves"] / max(1, res["hard_cuts"] + res["dissolves"]), 3)
+    k = int(np.argmax([r["longest_still_s"] for r in results]))
+    res["longest_still_s"] = results[k]["longest_still_s"]
+    res["longest_still_start_s"] = round(results[k]["longest_still_start_s"] + parts[k][0], 2)
+    res["max_event_gap_s"] = max(r["max_event_gap_s"] for r in results)
+    n_push = [r["push_in_per_min"] * r["duration_s"] / 60 for r in results]
+    n_fast = [r["fast_push_per_min"] * r["duration_s"] / 60 for r in results]
+    res["push_in_per_min"] = round(sum(n_push) / T * 60, 1)
+    res["fast_push_per_min"] = round(sum(n_fast) / T * 60, 1)
+    shares = [(r["push_in_share"], n) for r, n in zip(results, n_push) if n > 0]
+    res["push_in_share"] = round(sum(a * n for a, n in shares) / sum(n for _, n in shares), 2) if shares else 0.0
+    cvs = [r["zoom_curve_cv"] for r in results if r.get("zoom_curve_cv") is not None]
+    res["zoom_curve_cv"] = round(float(np.mean(cvs)), 3) if cvs else None
+    tm = [r["template_sim_max"] for r in results if r.get("template_sim_max") is not None]
+    res["template_sim_max"] = max(tm) if tm else None
+    ww = [(r["fast_ratio_worst_window"], r["worst_window_start_s"] + a, r["worst_window_len_s"])
+          for r, (a, _, _) in zip(results, parts) if r.get("fast_ratio_worst_window") is not None]
+    if ww:
+        w = min(ww, key=lambda x: x[0])
+        res["fast_ratio_worst_window"], res["worst_window_start_s"], res["worst_window_len_s"] = w[0], round(w[1], 2), w[2]
+    else:
+        res["fast_ratio_worst_window"], res["worst_window_start_s"], res["worst_window_len_s"] = None, None, 30.0
+    res["fast_ratio_by_10s"] = [v for r in results for v in r["fast_ratio_by_10s"]]
+    res["push_in_times_s"] = [t for r, (a, _, _) in zip(results, parts) for t in shift(r["push_in_times_s"], a)]
+    res["cut_times_s"] = [t for r, (a, _, _) in zip(results, parts) for t in shift(r["cut_times_s"], a)]
+    res["dissolve_times_s"] = [t for r, (a, _, _) in zip(results, parts) for t in shift(r["dissolve_times_s"], a)]
+    res["blank_runs_s"] = [(round(x + a, 2), round(y + a, 2)) for r, (a, _, _) in zip(results, parts) for x, y in r["blank_runs_s"]]
+    res["blank_run_s"] = round(max((y - x for x, y in res["blank_runs_s"]), default=0.0), 2)
+    res["parts"] = [{"index": i + 1, "label": lab, "start_s": a, "end_s": b, "duration_s": r["duration_s"],
+                     "fast_ratio": r["fast_ratio"], "shots": r["shots"], "asl_s": r["asl_s"],
+                     "blank_run_s": r["blank_run_s"], "push_in_per_min": r["push_in_per_min"],
+                     "fast_ratio_worst_window": r.get("fast_ratio_worst_window")}
+                    for i, (r, (a, b, lab)) in enumerate(zip(results, parts))]
+    res["fast_ratio_worst_part"] = min(p["fast_ratio"] for p in res["parts"])
+    return res
+
+
+def analyze_long(path, parts, sub_band=None, vertical="auto", template=None, jobs=None):
+    jobs = max(1, min(len(parts), jobs or os.cpu_count() or 2))
+    args = [(path, a, b, sub_band, vertical, template) for a, b, _ in parts]
+    if jobs == 1:
+        results = [_analyze_part(x) for x in args]
+    else:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        # spawn 不用 fork：父进程里 OpenCV 的线程池已经起来（先跑过 analyze、或被 deliver.py 调用）时，fork 出来的子进程会卡死在锁上
+        with ProcessPoolExecutor(jobs, mp_context=multiprocessing.get_context("spawn")) as ex:
+            results = list(ex.map(_analyze_part, args))
+    return merge_parts(path, parts, results)
+
+
 # ---------------------------------------------------------------- 打灯
 SHORT_S = float(os.environ.get("FILM_GATE_MIN_S", 20))  # 标定集都是 45 秒以上的成片；短于这个时长的片段读数噪声大，红灯降为黄灯只提示
 
 
 FACT_GATES = {"blank_run_s", "blue_purple_share"}   # 片长再短也照样红灯（配色不随片长变）
+LONG_ONLY = {"fast_ratio_worst_part"}             # 只有分段量的长片才有这一项，短片的报告里不出这一行
 
 
 def grade(res):
@@ -615,6 +734,8 @@ def grade(res):
     short = (res.get("duration_s") or 0) < SHORT_S
     for k, (name, direc, y, r, gate, unit) in METRICS.items():
         v = res.get(k)
+        if v is None and k in LONG_ONLY:
+            continue
         if v is None or direc == "info":
             rows.append((k, name, v, "--", gate, unit)); continue
         bad = (lambda t: v >= t) if direc == "high_bad" else (lambda t: v <= t)
@@ -675,6 +796,12 @@ def explain(res):
         head = f"镜头内有足够的快速动作（{fr:.1%}）"
     if res.get("short_clip_note"):
         head += "。" + res["short_clip_note"]
+    wp = res["lights"].get("fast_ratio_worst_part")
+    if wp in ("red", "yellow"):
+        p = min(res["parts"], key=lambda x: x["fast_ratio"])
+        msg = (f"第 {p['index']} 段（{p['label'] + '，' if p['label'] else ''}{fmt_ts(p['start_s'])}–{fmt_ts(p['end_s'])}）快动帧只有 {p['fast_ratio']:.1%}"
+               + ("，这一整段读起来像翻页" if wp == "red" else "，偏少"))
+        head = (msg + "；整片：" + head) if wp == "red" else head + "；" + msg
     blank_red = res["lights"].get("blank_run_s") == "red"
     if blank_red:
         segs = "、".join(f"{a:.2f}–{b:.2f}s" for a, b in res["blank_runs_s"])
@@ -702,16 +829,22 @@ def explain(res):
     if res.get("worst_window_start_s") is not None:
         a = res["worst_window_start_s"]
         ww = {"start_s": a, "end_s": round(a + res["worst_window_len_s"], 2), "fast_ratio": res["fast_ratio_worst_window"]}
-    fix = " ".join(x for x in (BP_FIX if bp == "red" else None, BLANK_FIX if blank_red else None, FIX if lv != "green" else None) if x) or None
+    fix = " ".join(x for x in (BP_FIX if bp == "red" else None, BLANK_FIX if blank_red else None,
+                               FIX if (lv != "green" or wp == "red") else None) if x) or None
     return {"summary": head, "why": why, "fix": fix, "look": look, "worst_window": ww, "blank_runs": res["blank_runs_s"]}
 
 
-def measure(path, sub_band=None, vertical="auto", template=DEFAULT_TEMPLATE, allow_blue_purple=None):
+def measure(path, sub_band=None, vertical="auto", template=DEFAULT_TEMPLATE, allow_blue_purple=None, parts=None, jobs=None):
     """量一支成片，返回带 lights / gate_light / verdict / explain 的结果。deliver.py 也调它。
-    allow_blue_purple：题材本身要蓝紫时的理由（非空字符串），蓝紫门禁降为黄灯，理由进结果。"""
+    allow_blue_purple：题材本身要蓝紫时的理由（非空字符串），蓝紫门禁降为黄灯，理由进结果。
+    parts：章节表（JSON 路径或列表，见 load_parts）。给了、或片长超过 LONG_S，就分段多进程量（长片模式）。"""
     tpl = template if template and os.path.exists(template) else None
     cv2.setNumThreads(max(1, (os.cpu_count() or 2) // 2))
-    res = analyze(path, sub_band=sub_band, vertical=vertical, template=tpl)
+    dur = probe(path)[2]
+    if parts is not None or dur > LONG_S:
+        res = analyze_long(path, load_parts(parts, dur), sub_band=sub_band, vertical=vertical, template=tpl, jobs=jobs)
+    else:
+        res = analyze(path, sub_band=sub_band, vertical=vertical, template=tpl)
     res["blue_purple_share"], res["blue_purple_spans_s"] = blue_purple(path)
     if allow_blue_purple and allow_blue_purple.strip():
         res["allow_blue_purple"] = allow_blue_purple.strip()
@@ -744,8 +877,21 @@ def report_lines(res, rows):
         L.append(f"  已声明题材需要蓝紫：{res['allow_blue_purple']}")
     if ex["worst_window"]:
         w = ex["worst_window"]
-        L.append(f"  最差 {w['end_s'] - w['start_s']:.0f} 秒窗口：{w['start_s']:.0f}–{w['end_s']:.0f}s，快动帧占比 {w['fast_ratio']}；"
-                 f"每 10 秒快动帧占比：{res['fast_ratio_by_10s']}")
+        L.append(f"  最差 {w['end_s'] - w['start_s']:.0f} 秒窗口：{w['start_s']:.0f}–{w['end_s']:.0f}s，快动帧占比 {w['fast_ratio']}"
+                 + ("" if res.get("parts") else f"；每 10 秒快动帧占比：{res['fast_ratio_by_10s']}"))
+    L += part_lines(res)
+    return L
+
+
+def part_lines(res):
+    """长片的逐段表（终端和交付说明共用）；短片返回空。"""
+    if not res.get("parts"):
+        return []
+    L = ["  逐段（长片按章节或每 3 分钟切开量；快动帧占比每段都要过 0.035 红线）："]
+    for p in res["parts"]:
+        lv = "red" if p["fast_ratio"] <= METRICS["fast_ratio"][3] else "yellow" if p["fast_ratio"] <= METRICS["fast_ratio"][2] else "green"
+        L.append(f"    {LIGHT[lv]} {p['index']:>2}. {fmt_ts(p['start_s']) + '–' + fmt_ts(p['end_s']):<16} {p['label'][:16]:<16} "
+                 f"快动 {p['fast_ratio']:.3f}  镜头 {p['shots']}  平均镜长 {p['asl_s']}s  推近 {p['push_in_per_min']}/分")
     return L
 
 
@@ -761,13 +907,16 @@ def main():
     ap.add_argument("--no-template", action="store_true")
     ap.add_argument("--allow-blue-purple", metavar="理由", default=None,
                     help="题材本身要蓝紫（用户点名的赛博朋克紫、梵高星月夜）时写理由，蓝紫门禁降为黄灯")
+    ap.add_argument("--parts", metavar="章节.json", default=None,
+                    help=f"长片按章节分段量（long_film.py assemble 写的 章节.json）；不给时片长超过 {LONG_S:g} 秒自动每 {PART_S:g} 秒一段")
+    ap.add_argument("-j", "--jobs", type=int, default=None, help="长片分段量的进程数（默认 CPU 核数）")
     a = ap.parse_args()
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         print("需要 ffmpeg/ffprobe", file=sys.stderr); sys.exit(1)
     try:
         res, rows = measure(a.mp4, sub_band=a.sub_band, vertical=a.vertical, template=None if a.no_template else a.template,
-                            allow_blue_purple=a.allow_blue_purple)
-    except (subprocess.CalledProcessError, KeyError, IndexError, RuntimeError, ValueError) as e:
+                            allow_blue_purple=a.allow_blue_purple, parts=a.parts, jobs=a.jobs)
+    except (subprocess.CalledProcessError, KeyError, IndexError, RuntimeError, ValueError, OSError) as e:
         print(f"读不了这支片：{a.mp4}（{e}）", file=sys.stderr); sys.exit(1)
     red = res["verdict"] == "red"
     if a.json:

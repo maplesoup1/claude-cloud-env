@@ -1,6 +1,6 @@
 ---
 name: huashu-art-motion
-description: "艺术与视频动画：拆解复刻动画；36种既有实做风格＋16种可迁移研究配方；9种解说动画语法，8种可按口播参数渲片段；含口播整片参考代码及框景检查；人用AI生帧；可选已有录音、系统声音与语音复刻，按需配置。"
+description: "艺术与视频动画：拆解复刻动画；36种既有实做风格＋16种可迁移研究配方；9种解说动画语法，8种可按口播参数渲片段；含口播整片参考代码及框景检查；10–30分钟长片分章制作、并行渲染与分章门禁；人用AI生帧；可选已有录音、系统声音与语音复刻，按需配置。"
 metadata:
   author: "花叔"
   homepage: "https://github.com/alchaincyf"
@@ -84,6 +84,9 @@ metadata:
 | 派 agent 画某个风格 / 自己写新风格 / 重做风格演示 | 先拉原作（`scripts/analyze/fetch_reference.py`）→ 按风格自己的构图规则定题材 → 形层过 `lib/medium.js` 媒介通道 → 并排对照打分 | **16** ＋ 15 ＋ 08 ＋ `风格配方/INDEX.md` |
 | 「一个人穿过一幅幅名画」「一路走过几个世界」 | 长卷骨架：每个世界一个段文件，主角从左走到右，跨边界换画风 | 11 ＋ `scripts/engine/demos/long_scroll/` |
 | 「做解说/科技/财经视频的动画」「Kurzgesagt/Vox/3b1b/白板/发布会/财经图表那种」、口播管线要一段动画 | 按口播选语法 → 过语法卡「起手必查」→ 管线用 `render.py --spec` 出时长精确的片段 | 09 ＋ `动画语法/<语法>.md` ＋ `镜头语言.md` |
+| 「做一支 10 分钟以上的片子」「20 分钟长视频」「一集」 | 总纲（画风锁＋章节表）→ 每章一张镜头表 → `long_film.py` 并行逐镜渲染、拼章、分章门禁 | **17** ＋ 镜头表模板 ＋ 09 |
+
+**长片（10 分钟以上）**：先读 `references/17-长片.md`。拆成 6–8 章，每章一张普通镜头表（短片规则照查），画风锁写在 `总纲.md` 里各章继承；用 `scripts/long_film.py` 走 init → lint → plan → render（逐镜并行、断点续渲）→ assemble（章节写进 mp4）→ gate（每章都要过快动红线）→ deliver。不要把 20 分钟写成一张几百行的表，也不要用 `render.py` 整片模式单进程渲。
 
 口播整片先读`references/12-口播整片与经验回流.md`；讲解员风格再读`references/动画语法/y6_presenter_explainer.md`。艺术史速通、穿越这类「同一场景换风格」的片子，机制见 02 号（五层机制），只用于这类片子。
 
@@ -122,11 +125,16 @@ uv run --with playwright python $E/render.py --out 成片.mp4 --audio 配乐.wav
 uv run --with playwright python $E/render.py --spec 片段.json --out 片段.mp4                  # 参数化片段
 python3 $E/compare.py --a 参考.mp4 --b 成片.mp4 --times 1.5,2.0 --out 对比.jpg                  # 并排
 uv run scripts/analyze/breakdown.py --video 参考.mp4 --out 拆解/                               # 拆解地图
+python3 scripts/long_film.py render <项目> -j 4                                                # 长片：逐镜并行渲染（见 17 号）
 ```
+
+出视频时加 `--jpeg`，帧从浏览器用 JPEG 0.95 传出来，每帧省 100–150ms（长片默认就这样）；静帧和 `--alpha` 永远是 PNG。
 
 字体在 `scripts/engine/lib/fonts/`（woff，各字体许可见同目录 `LICENSES.md`）。依赖：[uv](https://docs.astral.sh/uv/)、ffmpeg（出片与拆解）、Playwright Chromium（首次要 `uv run --with playwright playwright install chromium`）。
 
 ## 验收
+
+长片的验收见 17 号第六节：gate 按章分段量，每章都要过快动红线，审片至少两位。短片照下面做。
 
 交付前三样，按顺序：①`uv run scripts/qa.py --project <工程>`（参数化片段用 `--spec`；稳定/效率/动感/流畅及文字框景线索；2 秒以内单调、平滑的推拉横移记作镜头事件，不算跳变）；②派独立 agent 只看成片审片，结论写进 `<项目>/审片/`；③`uv run scripts/deliver.py 成片.mp4 --project <工程>（或 --spec）--out output/`。deliver.py 先过门禁 `film_gate.py`：快速运动帧占比 < 0.035 红灯，不复制成片、非零退出；< 0.06 黄灯。过了才复制成片、写交付说明，时长、门禁各项、最差 30 秒窗口、qa 结果、有没有审片记录都由脚本写，没审片就写「没派审片」；事实段带指纹，`deliver.py --verify` 查得出改动。门禁另外两条：成片中段连续 0.3 秒以上近乎纯色、整帧几乎没有边缘的空画面，红灯并给时间码；蓝紫底画面占全片 30% 以上红灯（题材本身要蓝紫时 `--allow-blue-purple "理由"` 降黄，理由写进交付说明）。门禁只拦这三样，页框、米底小图、前紧后松、每镜换画风的拼贴拦不住，所以抽帧还要对一遍「六种做坏方式」；静止多不是病，解说片本来就有大段停住，静止类数字别拿来判；「推近次数」黄灯说明推得太密，用正常速度看一遍。运镜顺不顺，抽帧看不出来，一定要用正常速度把成片看一遍。浅底无字幕成片再用`uv run --with numpy python scripts/subzone_gate.py 成片.mp4`检查图形进入字幕区；纹理底不适用。经验先看 `07-正面经验.md`。
 
