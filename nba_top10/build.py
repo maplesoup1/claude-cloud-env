@@ -89,10 +89,10 @@ for ch in sorted(分镜.S):
         b = (s_['cam'].get('base') or {}); bx, by, bz = b.get('x', 960), b.get('y', 540), b.get('z', 1.0)
         prev = shots[j - 1]['camz'] if j else ''; nxt = shots[j + 1]['camz'] if j + 1 < len(shots) else ''
         if prev != '拉远' and nxt != '拉远' and (k % 2 == 0 or prev in ('缓推', '快推')):
-            s_['cam'] = {'kind': '拉远', 'base': {'x': bx, 'y': by, 'z': bz * 1.24}, 'to': [bx, by], 'z1': bz, 'at': 0.0, 'dur': 1.0}; s_['camz'] = '拉远'
+            s_['cam'] = {'kind': '拉远', 'base': {'x': bx, 'y': by, 'z': bz * 1.38}, 'to': [bx, by], 'z1': bz, 'at': 0.0, 'dur': 1.0}; s_['camz'] = '拉远'
         else:
-            dx = 260 if (k // 2) % 2 else -260
-            s_['cam'] = {'kind': '横移', 'from': [bx + dx, by], 'to': [bx, by], 'z': bz * 1.12, 'at': 0.0, 'dur': 0.9}; s_['camz'] = '横移'
+            dx = 420 if (k // 2) % 2 else -420
+            s_['cam'] = {'kind': '横移', 'from': [bx + dx, by], 'to': [bx, by], 'z': bz * 1.15, 'at': 0.0, 'dur': 0.9}; s_['camz'] = '横移'
         k += 1
     # 对齐到帧
     total = fr(t); e = 0.0

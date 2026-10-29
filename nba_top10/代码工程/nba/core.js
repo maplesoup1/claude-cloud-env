@@ -34,7 +34,13 @@ const grains = [];
 const grain = k => { if (!grains[k]) { const g = document.createElement('canvas'); g.width = 480; g.height = 270; const x = g.getContext('2d'), im = x.createImageData(480, 270), r = U.rng(1000 + k);
     for (let i = 0; i < im.data.length; i += 4) { const v = r() * 255; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 22; }
     x.putImageData(im, 0, 0); grains[k] = g; } return grains[k]; };
+// 整体曝光：分层平涂的暗部太闷（全片平均亮度只有 47/255），统一提一档再上颗粒和暗角
+let _tmp = null;
+const expose = (c) => { if (!_tmp) { _tmp = document.createElement('canvas'); _tmp.width = W; _tmp.height = H; }
+  const g = _tmp.getContext('2d'); g.clearRect(0, 0, W, H); g.drawImage(c.canvas, 0, 0);
+  c.save(); c.setTransform(1, 0, 0, 1, 0, 0); c.filter = 'brightness(1.55) contrast(1.06)'; c.drawImage(_tmp, 0, 0); c.restore(); };
 const finish = (c, t) => {
+  expose(c);
   c.save(); c.globalCompositeOperation = 'overlay'; c.imageSmoothingEnabled = true; c.drawImage(grain(Math.floor(t * 12) % 6), 0, 0, W, H); c.restore();
   // 分层暗角：三圈平涂，不用渐变
   c.save(); c.fillStyle = rgba(C.bg, 0.14); c.beginPath(); c.rect(0, 0, W, H); ell(c, W / 2, H / 2, W * 0.62, H * 0.66); c.fill('evenodd');
