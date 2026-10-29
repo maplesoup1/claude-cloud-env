@@ -15,3 +15,5 @@
 代码工程/scenes/*
 !代码工程/scenes/c0*.js
 __pycache__/
+output/
+审片/帧/
