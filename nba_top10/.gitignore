@@ -1,0 +1,17 @@
+镜/
+章/
+渲染/
+成片.mp4
+*.noaudio.mp4
+口播/行/
+口播/*.wav
+口播/行.json
+音乐/*.wav
+方向/raw/
+代码工程/*
+!代码工程/nba/
+!代码工程/eras_nba.js
+!代码工程/scenes/
+代码工程/scenes/*
+!代码工程/scenes/c0*.js
+__pycache__/
