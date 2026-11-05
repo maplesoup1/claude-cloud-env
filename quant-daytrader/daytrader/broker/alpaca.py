@@ -23,6 +23,22 @@ from ..models import NY, Position, Side
 from .base import Broker
 
 log = logging.getLogger(__name__)
+HTTP_TIMEOUT = 10.0      # seconds; alpaca-py sets no timeout, so a hung call could block forever
+CLOSE_COOLDOWN = 20.0    # seconds to let a submitted close fill before sending another
+
+
+def with_timeout(client, seconds: float = HTTP_TIMEOUT):
+    """Give an alpaca-py REST client a default HTTP timeout."""
+    session = getattr(client, "_session", None)
+    if session is not None and not getattr(session, "_daytrader_timeout", False):
+        orig = session.request
+
+        def request(method, url, **kw):
+            kw.setdefault("timeout", seconds)
+            return orig(method, url, **kw)
+        session.request = request
+        session._daytrader_timeout = True
+    return client
 
 
 class AlpacaBroker(Broker):
@@ -30,7 +46,8 @@ class AlpacaBroker(Broker):
                  paper: bool = True, account_ttl: float = 5.0, positions_ttl: float = 2.0):
         if not paper:
             log.warning("LIVE (real money) trading enabled for %s", name)
-        self.client = TradingClient(api_key, secret_key, paper=paper)
+        self.client = with_timeout(TradingClient(api_key, secret_key, paper=paper))
+        self._closing: dict[str, float] = {}  # symbol -> monotonic time a close was sent
         self.symbols = set(symbols)
         self.name = name
         self._cache: dict[str, tuple[float, object]] = {}
@@ -119,6 +136,13 @@ class AlpacaBroker(Broker):
                     log.debug("cancel %s: %s", oid, e)
 
     def close_position(self, symbol: str, reason: str) -> None:
+        sent = self._closing.get(symbol)
+        if sent is not None and _time.monotonic() - sent < CLOSE_COOLDOWN:
+            self._invalidate()
+            if symbol in self.positions():
+                log.info("[%s] close %s already in flight; waiting", self.name, symbol)
+                return
+            self._closing.pop(symbol, None)
         log.warning("[%s] close %s (%s)", self.name, symbol, reason)
         last_err = None
         for attempt in range(2):  # kept short: the engine/watchdog retries on its next tick
@@ -132,6 +156,9 @@ class AlpacaBroker(Broker):
                 self._invalidate()
                 if symbol in self.positions():
                     self.client.close_position(symbol)
+                    self._closing[symbol] = _time.monotonic()
+                else:
+                    self._closing.pop(symbol, None)
                 self._invalidate()
                 return
             except Exception as e:
