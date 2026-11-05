@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import logging
 import queue
+import signal
 import threading
 import time as _time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 
-from .broker.alpaca import AlpacaBroker
+from .broker.alpaca import AlpacaBroker, with_timeout
 from .config import Config, alpaca_keys
 from .engine import Engine
 from .models import NY, Bar
@@ -89,7 +90,7 @@ def _warmup(instances: list[Instance], feed: str, now: datetime) -> None:
     from alpaca.data.timeframe import TimeFrame
 
     key, secret = instances[0].keys
-    client = StockHistoricalDataClient(key, secret)
+    client = with_timeout(StockHistoricalDataClient(key, secret))
     symbols = sorted({s for i in instances for s in i.cfg.symbols})
     req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame.Minute,
                            start=now - timedelta(days=5), end=now - timedelta(minutes=1), feed=DataFeed(feed))
@@ -108,7 +109,8 @@ def build_instances(cfgs: list[Config], notifier: Notifier) -> list[Instance]:
         keys = alpaca_keys(cfg.account_env)
         broker = AlpacaBroker(*keys, symbols=cfg.symbols, name=cfg.name, paper=cfg.live.paper)
         engine = Engine(build_strategy(cfg.strategy, cfg.bar_minutes), RiskManager(cfg.risk), broker,
-                        cfg.bar_minutes, notifier, journal_dir=cfg.live.log_dir, name=cfg.name)
+                        cfg.bar_minutes, notifier, journal_dir=cfg.live.log_dir, name=cfg.name,
+                        wall_clock=lambda: datetime.now(NY))
         out.append(Instance(cfg, broker, engine, keys, broker.account_number()))
     return out
 
@@ -167,33 +169,36 @@ def run_live(cfgs: list[Config]) -> None:
         for s in inst.cfg.symbols:
             routes[s].append(inst)
 
-    # The WebSocket handler only enqueues; a worker thread does all the (blocking) work,
-    # so slow REST calls or a flatten never stall market data.
-    bars: queue.Queue = queue.Queue()
+    # The WebSocket handler only enqueues. Each instance has its OWN queue + worker thread
+    # (and its own watchdog below), so a slow or hung REST call in one strategy never
+    # delays bars, flattens or halts of another.
+    queues = {inst.cfg.name: queue.Queue() for inst in instances}
     last_bar_at = [_time.monotonic()]
     stop = threading.Event()
 
-    def worker():
+    def worker(inst: Instance):
+        q = queues[inst.cfg.name]
         while not stop.is_set():
             try:
-                bar = bars.get(timeout=1)
+                bar = q.get(timeout=1)
             except queue.Empty:
                 continue
             lag = (datetime.now(NY) - (bar.ts + timedelta(minutes=1))).total_seconds()
             if lag > 90:
-                log.warning("processing %s %s %.0fs late", bar.symbol, bar.ts.time(), lag)
-            for inst in routes.get(bar.symbol, []):
-                try:
-                    inst.engine.on_minute_bar(bar)
-                except Exception:
-                    log.exception("[%s] error handling bar %s", inst.cfg.name, bar)
-                    notifier.send(f"[{inst.cfg.name}] ERROR handling {bar.symbol} bar; see logs")
+                log.warning("[%s] processing %s %s %.0fs late", inst.cfg.name, bar.symbol, bar.ts.time(), lag)
+            try:
+                inst.engine.on_minute_bar(bar)
+            except Exception:
+                log.exception("[%s] error handling bar %s", inst.cfg.name, bar)
+                notifier.send(f"[{inst.cfg.name}] ERROR handling {bar.symbol} bar; see logs")
 
     stream = StockDataStream(*instances[0].keys, feed=DataFeed(feed))
 
     async def on_bar(b):
         last_bar_at[0] = _time.monotonic()
-        bars.put(_to_bar(b))
+        bar = _to_bar(b)
+        for inst in routes.get(bar.symbol, []):
+            queues[inst.cfg.name].put(bar)
 
     stream.subscribe_bars(on_bar, *symbols)
 
@@ -224,15 +229,17 @@ def run_live(cfgs: list[Config]) -> None:
         threading.Thread(target=ts.run, daemon=True, name=f"trades-{acct}").start()
         trade_streams.append(ts)
 
-    def watchdog():
+    def watchdog(inst: Instance):
+        while not stop.wait(15):
+            try:
+                inst.engine.check_time_and_loss(datetime.now(NY), lock_timeout=30)
+            except Exception:
+                log.exception("[%s] watchdog check failed (will retry)", inst.cfg.name)
+
+    def supervisor():
         warned = False
         while not stop.wait(15):
             t = datetime.now(NY)
-            for inst in instances:
-                try:
-                    inst.engine.check_time_and_loss(t)
-                except Exception:
-                    log.exception("[%s] watchdog check failed (will retry)", inst.cfg.name)
             stale = _time.monotonic() - last_bar_at[0] > 180
             if stale and open_at + timedelta(minutes=3) <= t < close_at and not warned:
                 notifier.send("No market data for 3 minutes - check the stream")
@@ -246,14 +253,29 @@ def run_live(cfgs: list[Config]) -> None:
                 stream.stop()
                 return
 
-    threading.Thread(target=worker, daemon=True, name="bar-worker").start()
-    threading.Thread(target=watchdog, daemon=True, name="watchdog").start()
+    threads = []
+    for inst in instances:
+        threads.append(threading.Thread(target=worker, args=(inst,), daemon=True, name=f"worker-{inst.cfg.name}"))
+        threads.append(threading.Thread(target=watchdog, args=(inst,), daemon=True, name=f"watchdog-{inst.cfg.name}"))
+    threads.append(threading.Thread(target=supervisor, daemon=True, name="supervisor"))
+    for th in threads:
+        th.start()
+
+    def on_sigterm(signum, frame):  # systemd/kill: run the same shutdown path as Ctrl-C
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, on_sigterm)
+    except ValueError:  # not in the main thread (tests)
+        pass
+
     notifier.send(f"daytrader started ({'paper' if cfgs[0].live.paper else 'LIVE'}): "
                   + "; ".join(f"{c.name}={','.join(c.symbols)}" for c in cfgs))
     try:
         stream.run()  # blocks; alpaca-py reconnects on its own
     finally:
         stop.set()
+        for th in threads:  # let in-flight bar handling finish before the exit flatten
+            th.join(timeout=20)
         t = datetime.now(NY)
         if open_at <= t < close_at:
             # Exiting while the market is open (crash, Ctrl-C, stream error): do not leave
@@ -261,7 +283,8 @@ def run_live(cfgs: list[Config]) -> None:
             notifier.send("daytrader exiting during market hours - flattening all instances")
             for inst in instances:
                 try:
-                    inst.broker.flatten_all("process_exit")
+                    with inst.engine.lock:
+                        inst.broker.flatten_all("process_exit")
                 except Exception as e:
                     notifier.send(f"[{inst.cfg.name}] FLATTEN ON EXIT FAILED: {e} - CLOSE MANUALLY")
         summary = []
@@ -275,8 +298,18 @@ def run_live(cfgs: list[Config]) -> None:
         notifier.send("daytrader stopped. " + " | ".join(summary))
 
 
-def flatten_instances(cfgs: list[Config]) -> None:
-    """Safety net for cron: close each instance's own symbols (scoped, unlike `kill`)."""
+def flatten_instances(cfgs: list[Config], if_close_within: float | None = None) -> None:
+    """Safety net for cron: close each instance's own symbols (scoped, unlike `kill`).
+    With `if_close_within=N`, act only if the market is open and closes within N minutes
+    (lets one cron line cover both 13:00 half days and normal 16:00 closes)."""
+    if if_close_within is not None:
+        b0 = AlpacaBroker(*alpaca_keys(cfgs[0].account_env), symbols=cfgs[0].symbols, name=cfgs[0].name,
+                          paper=cfgs[0].live.paper)
+        clock = b0.clock()
+        mins = (clock.next_close - clock.timestamp).total_seconds() / 60
+        if not clock.is_open or mins > if_close_within:
+            print(f"market {'open' if clock.is_open else 'closed'}, close in {mins:.0f} min: nothing to do")
+            return
     failed = False
     for cfg in cfgs:
         b = AlpacaBroker(*alpaca_keys(cfg.account_env), symbols=cfg.symbols, name=cfg.name, paper=cfg.live.paper)

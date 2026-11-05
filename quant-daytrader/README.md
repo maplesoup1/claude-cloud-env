@@ -61,14 +61,19 @@ python -m daytrader -c ... kill                               # 紧急：撤销�
 ## 防隔夜持仓（多重保险）
 
 1. 引擎每根 K 线和看门狗每 15 秒都会检查：过了强平时间还有持仓或挂单，就**反复重试**平仓，直到全部平掉；单个标的平仓失败不会影响其他标的。
-2. 进程在开盘期间退出（崩溃、Ctrl-C、行情连接出错）时，会先平掉所有仓位。
+2. 进程在开盘期间退出（崩溃、Ctrl-C、`kill`/SIGTERM、行情连接出错）时，会先平掉所有仓位。
+   - 每个策略各有自己的处理线程和看门狗，一个策略的 API 调用卡住不会耽误其他策略平仓。
+   - 所有 HTTP 请求都有 10 秒超时。
+   - 已经发出的平仓单在 20 秒内不会重复提交；平仓失败的重试和通知都做了限频。
 3. 括号单的止损和止盈腿是**当日有效**的，收盘后就失效。所以要再用 cron 加一道和主进程**相互独立**的安全网：
 
 ```cron
 CRON_TZ=America/New_York
 20 9 * * 1-5   cd /path/to/quant-daytrader && .venv/bin/python -m daytrader -c configs/orb.yaml -c configs/vwap.yaml -c configs/momo.yaml paper >> logs/cron.log 2>&1
-59 15 * * 1-5  cd /path/to/quant-daytrader && .venv/bin/python -m daytrader -c configs/orb.yaml -c configs/vwap.yaml -c configs/momo.yaml flatten >> logs/cron.log 2>&1
+59 12,15 * * 1-5  cd /path/to/quant-daytrader && .venv/bin/python -m daytrader -c configs/orb.yaml -c configs/vwap.yaml -c configs/momo.yaml flatten --if-close-within 2 >> logs/cron.log 2>&1
 ```
+
+`--if-close-within 2` 表示只在距离收盘不到 2 分钟时才平仓。这样同一条 cron 在半天交易日的 12:59 和平常日的 15:59 都会生效，其他时间什么都不做。
 
 4. 回测中，到日终仍未平掉的仓位会按最后价格强制平仓（记为 `session_end`），绝不带到第二天。
 
