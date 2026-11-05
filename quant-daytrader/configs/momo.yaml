@@ -1,0 +1,36 @@
+# End-of-day intraday momentum on index ETFs: enter at 15:30 in the day's direction, exit ~15:58.
+name: momo
+account_env: ALPACA_MOMO
+symbols: [SPY, QQQ, IWM, DIA]
+bar_minutes: 5
+
+strategy:
+  name: intraday_momentum
+  params:
+    signal_time: "15:30"
+    mode: close_to_signal      # close_to_signal | first_half_hour | both
+    min_move: 0.003
+    max_move: 0.04
+    vwap_confirm: true
+    atr_period: 14
+    stop_atr_mult: 3.0
+    target_atr_mult: 6.0
+    allow_short: true
+
+risk:
+  risk_per_trade: 0.004
+  max_position_pct: 0.5        # index ETFs: notional cap is usually the binding limit
+  max_positions: 4
+  daily_max_loss: 0.02
+  flatten_at: "15:58"          # hold into the close, exit 2 minutes before
+  min_stop_pct: 0.001
+
+backtest:
+  start_equity: 30000
+  slippage_bps: 1.0            # SPY/QQQ spreads are ~1 cent
+  feed: sip
+
+live:
+  paper: true
+  feed: iex
+  log_dir: logs
