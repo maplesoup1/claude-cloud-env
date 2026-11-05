@@ -1,0 +1,44 @@
+# Gap fade - fade moderate overnight gaps after they fail (morning, counter-gap).
+name: gap
+account_env: ALPACA_GAP
+symbols: [AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA, AMD, AVGO, NFLX, JPM, XOM, COST, CRM]
+bar_minutes: 5
+
+strategy:
+  name: gap_fade
+  params:
+    min_gap: 0.01
+    max_gap: 0.04
+    range_minutes: 15
+    fill_frac: 0.75
+    stop_mode: vwap            # vwap | session_high
+    stop_buffer: 0.002
+    min_stop_atr: 1.0          # stop >= 1 ATR(5-min) away
+    atr_period: 14
+    max_prev_close_age_days: 4
+    max_stop_pct: 0.025
+    min_rr: 1.0
+    last_entry: "11:30"
+    allow_long: true
+    allow_short: true
+    max_hold_minutes: 0
+
+risk:
+  risk_per_trade: 0.005
+  max_position_pct: 0.25
+  max_positions: 3
+  max_gross_pct: 0.75
+  daily_max_loss: 0.02
+  flatten_at: "15:45"
+  min_stop_pct: 0.002
+  max_signal_delay_minutes: 2
+
+backtest:
+  start_equity: 30000
+  slippage_bps: 3.0            # gap mornings are wider
+  feed: sip
+
+live:
+  paper: true
+  feed: iex
+  log_dir: logs
