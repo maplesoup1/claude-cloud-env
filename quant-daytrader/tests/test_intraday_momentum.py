@@ -78,3 +78,49 @@ def test_no_trade_without_prior_close(ctx):
 def test_invalid_mode_rejected():
     with pytest.raises(ValueError):
         build_strategy(StrategyConfig("intraday_momentum", {"mode": "nope"}), 5)
+
+
+# ---- engine-level (review findings) ----------------------------------------
+def _engine(**risk):
+    from daytrader.engine import Engine
+    from daytrader.risk import RiskManager
+    from daytrader.config import RiskConfig
+    from conftest import sim_broker
+    b = sim_broker(equity=30_000)
+    cfg = RiskConfig(flatten_at=time(15, 58), max_position_pct=0.4, **risk)
+    return Engine(strat(), RiskManager(cfg), b, 5), b
+
+
+def _feed_minutes(eng, skip=()):
+    from conftest import flat
+    eng.on_minute_bar(flat(15, 59, 100, day=PREV))
+    t = at(9, 30)
+    while t < at(16, 0):
+        k = (t - at(9, 30)).seconds // 60
+        if t.time() not in skip:
+            px = 100 + 0.002 * k
+            eng.on_minute_bar(mk(t.hour, t.minute, px, px + 0.1, px - 0.1, px))
+        t += timedelta(minutes=1)
+
+
+def test_engine_enters_at_1530_and_flattens_at_1558():
+    eng, b = _engine()
+    _feed_minutes(eng)
+    [tr] = b.trades
+    assert tr["entry_time"] == at(15, 30) and tr["exit_time"] == at(15, 58) and tr["reason"] == "eod"
+
+
+def test_late_signal_bar_does_not_trade():
+    """15:26-15:44 missing: the 15:25 bucket is only completed at 15:45 - too late."""
+    skip = {time(15, m) for m in range(26, 45)}
+    eng, b = _engine()
+    _feed_minutes(eng, skip=skip)
+    assert b.trades == []
+    assert eng.signals and eng.signals[0]["decision"] == "stale signal bar"
+
+
+def test_signal_time_validation():
+    with pytest.raises(ValueError):
+        build_strategy(StrategyConfig("intraday_momentum", {"signal_time": "15:32"}), 5)
+    with pytest.raises(ValueError):
+        build_strategy(StrategyConfig("intraday_momentum", {"signal_time": "15:58"}), 5)

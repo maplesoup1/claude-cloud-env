@@ -1,7 +1,7 @@
 # End-of-day intraday momentum on index ETFs: enter at 15:30 in the day's direction, exit ~15:58.
 name: momo
 account_env: ALPACA_MOMO
-symbols: [SPY, QQQ, IWM, DIA]
+symbols: [SPY, QQQ]            # IWM/DIA move with these: adding them just levers the same bet
 bar_minutes: 5
 
 strategy:
@@ -19,11 +19,13 @@ strategy:
 
 risk:
   risk_per_trade: 0.004
-  max_position_pct: 0.5        # index ETFs: notional cap is usually the binding limit
-  max_positions: 4
+  max_position_pct: 0.4        # index ETFs: notional cap is usually the binding limit
+  max_positions: 2
+  max_gross_pct: 0.8           # SPY+QQQ together <= 80% of equity (they are one directional bet)
   daily_max_loss: 0.02
   flatten_at: "15:58"          # hold into the close, exit 2 minutes before
   min_stop_pct: 0.001
+  max_signal_delay_minutes: 2  # a late 15:30 bar (sparse IEX data) must not trade stale prices
 
 backtest:
   start_equity: 30000

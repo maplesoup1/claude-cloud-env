@@ -21,12 +21,15 @@ Exit
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, time, timedelta
 
 from ..indicators import ATR, SessionStats
 from ..models import Bar, Side, Signal
 from .base import Context, Strategy, register
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,6 +50,8 @@ class _Day:
     day: date
     first_half_close: float | None = None
     traded: bool = False
+    saw_signal_bar: bool = False
+    warned: bool = False
 
 
 @register
@@ -62,6 +67,10 @@ class IntradayMomentum(Strategy):
             raise ValueError("mode must be close_to_signal | first_half_hour | both")
         if 30 % bar_minutes:
             raise ValueError("bar_minutes must divide 30")
+        if (params.signal_time.hour * 60 + params.signal_time.minute) % bar_minutes:
+            raise ValueError("signal_time must fall on a bar boundary")
+        if not time(10, 0) < params.signal_time < time(15, 55):
+            raise ValueError("signal_time must be between 10:00 and 15:55")
         self._sess: dict[str, SessionStats] = {}
         self._atr: dict[str, ATR] = {}
         self._days: dict[str, _Day] = {}
@@ -85,6 +94,11 @@ class IntradayMomentum(Strategy):
 
         if end == self.FIRST_HALF_END:
             st.first_half_close = bar.close
+        if end == p.signal_time:
+            st.saw_signal_bar = True
+        elif end > p.signal_time and not st.saw_signal_bar and not st.warned:
+            st.warned = True
+            log.warning("intraday_momentum: no %s bar ending %s today - no trade", bar.symbol, p.signal_time)
         if end != p.signal_time or st.traded:
             return []
         if sess.prev_close is None or atr is None:
