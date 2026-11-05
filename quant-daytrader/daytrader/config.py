@@ -9,11 +9,17 @@ from pathlib import Path
 import yaml
 
 
-def parse_time(s: str | time) -> time:
+def parse_time(s: str | int | time) -> time:
     if isinstance(s, time):
         return s
-    h, m = str(s).split(":")
-    return time(int(h), int(m))
+    if isinstance(s, int):  # YAML 1.1 reads unquoted 15:45 as sexagesimal 945
+        h, m = divmod(s, 60)
+        return time(h, m)
+    try:
+        h, m = str(s).split(":")
+        return time(int(h), int(m))
+    except ValueError as e:
+        raise ValueError(f"bad time {s!r}; use \"HH:MM\"") from e
 
 
 @dataclass
@@ -27,9 +33,11 @@ class RiskConfig:
     risk_per_trade: float = 0.005    # fraction of equity lost if stop is hit
     max_position_pct: float = 0.25   # max notional per position as fraction of equity
     max_positions: int = 3           # concurrent positions + pending entries
+    max_gross_pct: float = 1.0       # total notional of open positions as fraction of equity
     daily_max_loss: float = 0.02     # halt + flatten when down this much on the day
     flatten_at: time = time(15, 45)  # flatten everything at/after this time
     min_stop_pct: float = 0.001      # reject signals whose stop is closer than this (sizing blow-up guard)
+    max_signal_delay_minutes: float = 2.0  # reject entries from bars that completed (arrived) late
 
 
 @dataclass
@@ -74,6 +82,12 @@ def build_dataclass(cls, data: dict | None):
     return cls(**data)
 
 
+def _symbols(v, path) -> list[str]:
+    if not isinstance(v, list):
+        raise ValueError(f"{path}: symbols must be a YAML list, e.g. [SPY, QQQ]")
+    return [str(x).upper() for x in v]
+
+
 def load_config(path: str | Path = "config.yaml") -> Config:
     raw = yaml.safe_load(Path(path).read_text()) or {}
     known = {f.name for f in fields(Config)}
@@ -84,18 +98,37 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     cfg = Config(
         name=str(raw.get("name", s.get("name", "orb"))),
         account_env=str(raw.get("account_env", "ALPACA")),
-        symbols=[x.upper() for x in raw.get("symbols", ["SPY", "QQQ"])],
+        symbols=_symbols(raw.get("symbols", ["SPY", "QQQ"]), path),
         bar_minutes=int(raw.get("bar_minutes", 5)),
         strategy=StrategyConfig(name=s.get("name", "orb"), params=s.get("params") or {}),
         risk=build_dataclass(RiskConfig, raw.get("risk")),
         backtest=build_dataclass(BacktestConfig, raw.get("backtest")),
         live=build_dataclass(LiveConfig, raw.get("live")),
     )
-    if 60 % cfg.bar_minutes:
-        raise ValueError("bar_minutes must divide 60")
-    if not cfg.name.replace("_", "").replace("-", "").isalnum():
-        raise ValueError("name must be alphanumeric (plus - and _)")
+    validate_config(cfg, str(path))
     return cfg
+
+
+def validate_config(cfg: Config, where: str = "config") -> None:
+    def bad(msg):
+        raise ValueError(f"{where}: {msg}")
+
+    if not isinstance(cfg.symbols, list) or not cfg.symbols or not all(isinstance(x, str) for x in cfg.symbols):
+        bad("symbols must be a non-empty list")
+    if cfg.bar_minutes <= 0 or 30 % cfg.bar_minutes:
+        bad("bar_minutes must divide 30 (1, 2, 3, 5, 6, 10, 15, 30)")
+    r = cfg.risk
+    for k in ("risk_per_trade", "max_position_pct", "daily_max_loss", "min_stop_pct"):
+        if not 0 < getattr(r, k) <= 1:
+            bad(f"risk.{k} must be in (0, 1]")
+    if not 0 < r.max_gross_pct <= 4:
+        bad("risk.max_gross_pct must be in (0, 4]")
+    if r.max_positions < 1:
+        bad("risk.max_positions must be >= 1")
+    if not (time(9, 30) < r.flatten_at < time(16, 0)):
+        bad("risk.flatten_at must be between 09:30 and 16:00")
+    if not cfg.name.replace("_", "").replace("-", "").isalnum():
+        bad("name must be alphanumeric (plus - and _)")
 
 
 def alpaca_keys(account_env: str = "ALPACA") -> tuple[str, str]:
