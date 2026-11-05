@@ -26,12 +26,15 @@ Exit
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 from ..indicators import RSI, SessionStats
 from ..models import Bar, Exit, Side, Signal
 from .base import Context, Strategy, register
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -78,6 +81,7 @@ class VwapReversion(Strategy):
         self._days: dict[str, _Day] = {}
         # market proxy: list of (bar_end, move) for the current day, newest last
         self._mkt: list[tuple[datetime, float]] = []
+        self._warned_no_market: date | None = None
 
     def _day(self, symbol: str, d: date) -> _Day:
         st = self._days.get(symbol)
@@ -115,10 +119,15 @@ class VwapReversion(Strategy):
                 self._mkt = [x for x in self._mkt if x[0].date() == end.date()] + [(end, mv)]
 
         out: list = []
-        if st.entry_at and ctx.position(bar.symbol) is not None:
+        pos = ctx.position(bar.symbol)
+        if pos is not None:
+            if st.entry_at is None:
+                # Position we did not see entered (e.g. restart): start the time-stop clock now.
+                st.entry_at = end
             if end - st.entry_at >= timedelta(minutes=p.max_hold_minutes):
                 st.entry_at = None
                 return [Exit(bar.symbol, "time_stop", bar.ts)]
+            return out  # already in a trade on this symbol: no new signal, counters untouched
 
         if not (p.first_entry <= bar.ts.time() and end.time() <= p.last_entry):
             return out
@@ -132,6 +141,11 @@ class VwapReversion(Strategy):
         day_move = self._day_move(sess)
         if day_move is None or abs(day_move) > p.max_day_move_pct:
             return out
+
+        if p.market_symbol and market_move is None and self._warned_no_market != bar.ts.date():
+            self._warned_no_market = bar.ts.date()
+            log.warning("vwap_reversion: no %s data yet - market filter inactive (is it in symbols?)",
+                        p.market_symbol)
 
         c = bar.close
         dist = (c - vwap) / c

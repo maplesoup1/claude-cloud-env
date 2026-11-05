@@ -124,3 +124,44 @@ def test_time_stop_exit():
     exits = [a for a in acts if isinstance(a, Exit)]
     assert len(exits) == 1 and exits[0].reason == "time_stop"
     assert exits[0].ts == t + timedelta(minutes=30)       # bar ending 30 min after the signal bar ended
+
+
+def test_no_new_signal_while_in_position_and_time_stop_not_extended():
+    """Review finding: a second signal during an open trade must not reset the time stop
+    or consume the day's trade quota."""
+    def run(ctx_after_entry):
+        s = strat(max_hold_minutes=60, cooldown_minutes=0, max_day_move_pct=0.5)
+        px, t, _ = drift_down(s, FakeCtx())
+        assert s.on_bar(reversal(t, px), FakeCtx())        # entry, signal bar ends t+5
+        acts, p2 = [], px
+        for i in range(1, 14):
+            tt = t + timedelta(minutes=5 * i)
+            if i == 7:                                     # a valid 2nd signal if flat
+                acts += s.on_bar(reversal(tt, p2), ctx_after_entry)
+                continue
+            o, c = p2, p2 - 1.0                            # deep second flush
+            acts += s.on_bar(mk(tt.hour, tt.minute, o, o + 0.02, c - 0.05, c), ctx_after_entry)
+            p2 = c
+        return s, t, acts
+
+    # control: with no position the setup DOES produce a second signal
+    _, _, flat_acts = run(FakeCtx())
+    assert any(not isinstance(a, Exit) for a in flat_acts)
+
+    s, t, acts = run(FakeCtx({"X": Position("X", Side.LONG, 1, 95)}))
+    exits = [a for a in acts if isinstance(a, Exit)]
+    signals = [a for a in acts if not isinstance(a, Exit)]
+    assert signals == []
+    assert len(exits) == 1 and exits[0].ts == t + timedelta(minutes=60)
+    assert s._days["X"].trades == 1
+
+
+def test_restart_with_unknown_position_starts_time_stop_clock():
+    s = strat(max_hold_minutes=30)
+    held = FakeCtx({"X": Position("X", Side.LONG, 1, 100)})
+    acts = []
+    for i in range(8):
+        tt = at(11, 0) + timedelta(minutes=5 * i)
+        acts += s.on_bar(mk(tt.hour, tt.minute, 100, 100, 100, 100), held)
+    exits = [a for a in acts if isinstance(a, Exit)]
+    assert len(exits) == 1 and exits[0].ts == at(11, 30)

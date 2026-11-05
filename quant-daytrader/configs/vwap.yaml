@@ -28,11 +28,14 @@ strategy:
 
 risk:
   risk_per_trade: 0.004
-  max_position_pct: 0.25
+  max_position_pct: 0.4        # stops are ~0.3-0.6%, so this cap is usually binding:
+                               # effective risk per trade ~0.15-0.25% of equity
   max_positions: 3
+  max_gross_pct: 1.0           # SPY/QQQ/IWM often signal together: cap the combined bet
   daily_max_loss: 0.02
   flatten_at: "15:45"
   min_stop_pct: 0.001
+  max_signal_delay_minutes: 2
 
 backtest:
   start_equity: 30000
