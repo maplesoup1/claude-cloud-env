@@ -37,6 +37,7 @@ def main() -> None:
 
     sub.add_parser("paper", help="trade today (paper unless live.paper=false)")
     sub.add_parser("status", help="show accounts, positions, open orders")
+    sub.add_parser("flatten", help="close each instance's own symbols (cron safety net)")
     sub.add_parser("kill", help="cancel ALL orders and close ALL positions in each account NOW")
     sub.add_parser("list", help="list available strategies and their parameters")
 
@@ -57,19 +58,21 @@ def main() -> None:
         _setup_logging(None, args.verbose)
         logging.getLogger("daytrader.engine").setLevel(logging.DEBUG if args.verbose else logging.WARNING)
         from .backtest import portfolio_report, run_backtest
-        from .data import fetch_alpaca_minutes, synthetic_minutes
+        from .data import fetch_alpaca_minutes, fetch_calendar, synthetic_minutes
 
         symbols = sorted({s for c in cfgs for s in c.symbols})
+        calendar = None
         if args.source == "synthetic":
             bars = synthetic_minutes(symbols, days=args.days, seed=args.seed)
         else:
             bars = fetch_alpaca_minutes(symbols, args.start, args.end, feed=cfgs[0].backtest.feed,
                                         account_env=cfgs[0].account_env)
+            calendar = fetch_calendar(args.start, args.end, account_env=cfgs[0].account_env)
         print(f"{len(bars):,} minute bars, {bars.symbol.nunique()} symbols")
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
         for slip in args.slippage_bps or [None]:
-            results = [run_backtest(c, bars, slippage_bps=slip) for c in cfgs]
+            results = [run_backtest(c, bars, slippage_bps=slip, calendar=calendar) for c in cfgs]
             label = "config" if slip is None else f"{slip:g}"
             for c, res in zip(cfgs, results):
                 print(f"\n=== {c.name} ({c.strategy.name}) slippage={label} bps/side ===")
@@ -84,9 +87,9 @@ def main() -> None:
         return
 
     _setup_logging(cfgs[0].live.log_dir, args.verbose)
-    from .live import kill_switch, run_live, status
+    from .live import flatten_instances, kill_switch, run_live, status
 
-    {"paper": run_live, "status": status, "kill": kill_switch}[args.cmd](cfgs)
+    {"paper": run_live, "status": status, "kill": kill_switch, "flatten": flatten_instances}[args.cmd](cfgs)
 
 
 if __name__ == "__main__":

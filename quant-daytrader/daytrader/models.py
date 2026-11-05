@@ -27,6 +27,11 @@ class Bar:
     low: float
     close: float
     volume: float
+    first_ts: datetime | None = None  # aggregated bars: start of the first 1-minute bar actually seen
+
+    @property
+    def first(self) -> datetime:
+        return self.first_ts or self.ts
 
 
 @dataclass(frozen=True)

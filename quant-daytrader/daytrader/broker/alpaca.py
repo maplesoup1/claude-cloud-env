@@ -1,7 +1,9 @@
 """Alpaca broker (paper by default).
 
 - Entries are bracket orders, so stops/targets live on Alpaca's servers and keep
-  working even if this process dies.
+  working if this process dies - BUT only until the close: legs are DAY orders and
+  expire at 16:00, and nothing would flatten the position. Run the separate
+  `daytrader flatten` safety net from cron (see README).
 - Everything is scoped to `symbols`: flatten/close only touch this strategy's
   symbols, so several strategies can share an account if their symbols differ.
   (Recommended: one paper account per strategy, so daily-loss limits are separate.)
@@ -68,12 +70,14 @@ class AlpacaBroker(Broker):
         return dict(self._cached("positions", fetch))
 
     def open_orders(self, symbols: list[str] | None = None):
+        """Open orders, FLAT (nested=False): bracket legs whose parent already filled are
+        listed as their own orders, so they can be seen and cancelled."""
         syms = sorted(symbols or self.symbols)
-        if symbols is None:
-            return self._cached("orders", lambda: self.client.get_orders(
-                GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, symbols=syms, limit=500)))
-        return self.client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True,
-                                                       symbols=syms, limit=500))
+
+        def fetch():
+            return self.client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=False,
+                                                           symbols=syms, limit=500))
+        return self._cached("orders", fetch) if symbols is None else fetch()
 
     def busy_symbols(self) -> set[str]:
         return set(self.positions()) | {o.symbol for o in self.open_orders()}
@@ -108,8 +112,7 @@ class AlpacaBroker(Broker):
 
     def _cancel_symbol_orders(self, symbol: str) -> None:
         for o in self.open_orders([symbol]):
-            ids = [o.id] + [leg.id for leg in (o.legs or [])]
-            for oid in ids:
+            for oid in [o.id] + [leg.id for leg in (o.legs or [])]:
                 try:
                     self.client.cancel_order_by_id(oid)
                 except APIError as e:  # already filled/cancelled
@@ -117,10 +120,11 @@ class AlpacaBroker(Broker):
 
     def close_position(self, symbol: str, reason: str) -> None:
         log.warning("[%s] close %s (%s)", self.name, symbol, reason)
-        for attempt in range(4):
+        last_err = None
+        for attempt in range(2):  # kept short: the engine/watchdog retries on its next tick
             try:
                 self._cancel_symbol_orders(symbol)
-                # Bracket legs hold the shares until the cancel is processed.
+                # Bracket legs hold the shares until the cancels are processed.
                 for _ in range(10):
                     if not self.open_orders([symbol]):
                         break
@@ -131,14 +135,23 @@ class AlpacaBroker(Broker):
                 self._invalidate()
                 return
             except Exception as e:
+                last_err = e
                 log.error("[%s] close %s attempt %d failed: %s", self.name, symbol, attempt + 1, e)
-                _time.sleep(2 ** attempt)
-        raise RuntimeError(f"[{self.name}] closing {symbol} failed 4 times - CHECK THE ACCOUNT MANUALLY")
+                _time.sleep(1)
+        raise RuntimeError(f"[{self.name}] closing {symbol} failed: {last_err}")
 
     def flatten_all(self, reason: str) -> None:
+        """Close every symbol; one failure does not stop the others. Raises at the end
+        if anything failed so the caller retries."""
         self._invalidate()
+        failed = []
         for sym in sorted(self.busy_symbols()):
-            self.close_position(sym, reason)
+            try:
+                self.close_position(sym, reason)
+            except Exception as e:
+                failed.append(f"{sym}: {e}")
+        if failed:
+            raise RuntimeError(f"[{self.name}] flatten incomplete: {failed}")
 
     # ---- live-only helpers -----------------------------------------------
     def symbols_traded_today(self, today: date) -> set[str]:

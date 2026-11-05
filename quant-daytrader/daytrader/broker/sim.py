@@ -40,6 +40,8 @@ class SimBroker(Broker):
         self._pending: dict[str, _Order] = {}
         self._to_close: dict[str, str] = {}  # symbol -> reason
         self._last: dict[str, float] = {}
+        self._last_ts: dict = {}
+        self._entry_fees: dict[str, float] = {}
         self._day: date | None = None
         self._day_start_equity = cfg.start_equity
         self.trades: list[dict] = []
@@ -95,24 +97,39 @@ class SimBroker(Broker):
         d = now.date()
         if self._day != d:
             if self._day is not None:
+                self._force_close_leftovers()
                 self.daily_equity.append((self._day, self.equity()))
             self._day = d
             self._day_start_equity = self.equity()
 
+    def _force_close_leftovers(self) -> None:
+        """Safety net: nothing survives the session. Anything still open (e.g. no bar
+        after the flatten time for that symbol) is closed at its last price with slippage."""
+        self._pending.clear()
+        for sym, p in list(self._positions.items()):
+            px = self._last.get(sym, p.entry_price)
+            ts = self._last_ts.get(sym, p.opened_at)
+            log.warning("sim: %s still open at session end, force-closing at %.4f", sym, px)
+            self._close(p, self._slip(px, buying=p.side is Side.SHORT), ts, "session_end")
+        self._to_close.clear()
+
     def finish(self) -> None:
         if self._day is not None:
+            self._force_close_leftovers()
             self.daily_equity.append((self._day, self.equity()))
 
-    def _close(self, p: Position, px: float, bar: Bar, reason: str) -> None:
+    def _close(self, p: Position, px: float, when, reason: str) -> None:
+        exit_time = when.ts if isinstance(when, Bar) else when
         sign = 1 if p.side is Side.LONG else -1
         gross = sign * (px - p.entry_price) * p.qty
-        fees = self._fees(p.qty, px, selling=p.side is Side.LONG)
-        self.cash_pnl += gross - fees
+        exit_fee = self._fees(p.qty, px, selling=p.side is Side.LONG)
+        self.cash_pnl += gross - exit_fee
+        fees = exit_fee + self._entry_fees.pop(p.symbol, 0.0)  # trade P&L includes both legs' fees
         risk = abs(p.entry_price - p.stop) * p.qty if p.stop is not None else 0.0
         self.trades.append({
             "symbol": p.symbol, "side": p.side.value, "qty": p.qty,
             "entry_time": p.opened_at, "entry": round(p.entry_price, 4),
-            "exit_time": bar.ts, "exit": round(px, 4), "reason": reason,
+            "exit_time": exit_time, "exit": round(px, 4), "reason": reason,
             "pnl": round(gross - fees, 2), "r": round((gross - fees) / risk, 3) if risk else None,
         })
         del self._positions[p.symbol]
@@ -134,7 +151,9 @@ class SimBroker(Broker):
             if invalid:  # price already through stop/target: a real bracket would be rejected
                 self.rejected += 1
             else:
-                self.cash_pnl -= self._fees(order.qty, fill, selling=not buying)
+                entry_fee = self._fees(order.qty, fill, selling=not buying)
+                self.cash_pnl -= entry_fee
+                self._entry_fees[sym] = entry_fee
                 self._positions[sym] = Position(sym, order.side, order.qty, fill, order.stop, order.target, bar.ts)
 
         p = self._positions.get(sym)
@@ -155,3 +174,4 @@ class SimBroker(Broker):
                     self._close(p, p.target, bar, "target")
 
         self._last[sym] = bar.close
+        self._last_ts[sym] = bar.ts
