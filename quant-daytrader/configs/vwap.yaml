@@ -1,0 +1,45 @@
+# VWAP mean reversion - mid-day counter-trend on liquid, lower-volatility large caps.
+name: vwap
+account_env: ALPACA_VWAP
+symbols: [SPY, QQQ, IWM, AAPL, MSFT, AMZN, GOOGL, META]
+bar_minutes: 5
+
+strategy:
+  name: vwap_reversion
+  params:
+    band_k: 2.0
+    min_band_pct: 0.004
+    rsi_period: 7
+    rsi_long_max: 25
+    rsi_short_min: 75
+    confirm_reversal: true
+    stop_k: 1.0
+    target_frac: 1.0
+    min_rr: 0.8
+    max_day_move_pct: 0.025
+    market_symbol: SPY
+    market_max_move: 0.01
+    first_entry: "10:00"
+    last_entry: "15:00"
+    allow_short: true
+    max_trades_per_symbol: 2
+    cooldown_minutes: 30
+    max_hold_minutes: 60
+
+risk:
+  risk_per_trade: 0.004
+  max_position_pct: 0.25
+  max_positions: 3
+  daily_max_loss: 0.02
+  flatten_at: "15:45"
+  min_stop_pct: 0.001
+
+backtest:
+  start_equity: 30000
+  slippage_bps: 2.0
+  feed: sip
+
+live:
+  paper: true
+  feed: iex
+  log_dir: logs
