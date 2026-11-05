@@ -24,9 +24,11 @@ risk:
   risk_per_trade: 0.005        # 0.5% of equity per trade
   max_position_pct: 0.25
   max_positions: 3
+  max_gross_pct: 0.75          # all open positions together <= 75% of equity
   daily_max_loss: 0.02         # -2% on the day -> flatten + stop for the day
   flatten_at: "15:45"
   min_stop_pct: 0.001
+  max_signal_delay_minutes: 2  # ignore entries from bars that arrived late
 
 backtest:
   start_equity: 30000

@@ -72,6 +72,17 @@ def fetch_alpaca_minutes(symbols: list[str], start: date, end: date, feed: str =
     return df[(df.ts >= lo) & (df.ts < hi)].reset_index(drop=True)
 
 
+def fetch_calendar(start: date, end: date, account_env: str = "ALPACA"):
+    """Real exchange calendar (holidays, half days) from Alpaca."""
+    from alpaca.trading.client import TradingClient
+
+    from .config import alpaca_keys
+    from .sessions import SessionCalendar
+
+    key, secret = alpaca_keys(account_env)
+    return SessionCalendar.from_alpaca(TradingClient(key, secret, paper=True), start, end)
+
+
 def synthetic_minutes(symbols: list[str], days: int = 60, seed: int = 7,
                       start: date = date(2025, 1, 6), trend: float = 0.00012,
                       gap_sd: float = 0.006) -> pd.DataFrame:

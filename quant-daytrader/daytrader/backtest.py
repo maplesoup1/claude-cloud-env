@@ -11,6 +11,7 @@ from .config import Config
 from .data import iter_bars
 from .engine import Engine
 from .risk import RiskManager
+from .sessions import SessionCalendar
 from .strategy import build_strategy
 
 
@@ -23,12 +24,13 @@ class BacktestResult:
     signals: pd.DataFrame
 
 
-def run_backtest(cfg: Config, bars: pd.DataFrame, slippage_bps: float | None = None) -> BacktestResult:
+def run_backtest(cfg: Config, bars: pd.DataFrame, slippage_bps: float | None = None,
+                 calendar: SessionCalendar | None = None) -> BacktestResult:
     bt_cfg = cfg.backtest if slippage_bps is None else replace(cfg.backtest, slippage_bps=slippage_bps)
     bars = bars[bars.symbol.isin(cfg.symbols)]
     broker = SimBroker(bt_cfg)
-    engine = Engine(build_strategy(cfg.strategy, cfg.bar_minutes), RiskManager(cfg.risk), broker,
-                    cfg.bar_minutes, name=cfg.name)
+    engine = Engine(build_strategy(cfg.strategy, cfg.bar_minutes), RiskManager(cfg.risk, calendar), broker,
+                    cfg.bar_minutes, name=cfg.name, calendar=calendar)
     for bar in iter_bars(bars):
         engine.on_minute_bar(bar)
     broker.finish()

@@ -20,7 +20,8 @@ Engine.on_minute_bar：收盘前强平 / 单日亏损熔断 → 模拟撮合（�
 | `daytrader/engine.py` | 核心事件循环，回测和实盘共用；每个策略实例一份 JSONL 交易日志 |
 | `daytrader/strategy/` | 策略。新增策略只需加一个文件，用 `@register` 注册后自动发现 |
 | `daytrader/indicators.py` | VWAP（含标准差带）、跳空、前收盘、ATR、RSI、EMA，全部只用已完成的 K 线计算 |
-| `daytrader/risk.py` | 按风险计算仓位，检查最大持仓、止损和止盈方向、止损过近，单日亏损熔断，收盘前强平 |
+| `daytrader/risk.py` | 按风险计算仓位，限制单个持仓和总持仓规模，检查最大持仓数、止损和止盈方向、止损过近，拒绝过期信号，单日亏损熔断，收盘前强平 |
+| `daytrader/sessions.py` | 交易日历（节假日、半天交易日） |
 | `daytrader/broker/sim.py` | 回测撮合：在下一根K线开盘价成交并计滑点；同一根K线内止损和止盈都触发时按止损算；跳空越过止损按开盘价成交 |
 | `daytrader/broker/alpaca.py` | Alpaca 括号单，止损和止盈挂在券商端；所有操作只针对本策略自己的标的 |
 | `daytrader/live.py` | 多策略实盘：校验配置冲突、交易日历和半天交易日、预热、重启对账、成交回报写入日志、看门狗 |
@@ -53,8 +54,27 @@ python -m daytrader -c configs/orb.yaml backtest --start 2024-01-01 --end 2025-1
 python -m daytrader -c configs/a.yaml -c configs/b.yaml backtest              # 多策略回测，输出组合表现和相关性
 python -m daytrader -c configs/a.yaml -c configs/b.yaml paper                 # 多策略模拟盘
 python -m daytrader -c ... status                             # 查看各账户、持仓、挂单
+python -m daytrader -c ... flatten                            # 只平掉各策略自己的标的（cron 安全网用）
 python -m daytrader -c ... kill                               # 紧急：撤销各账户所有挂单并平掉所有仓位
 ```
+
+## 防隔夜持仓（多重保险）
+
+1. 引擎每根 K 线和看门狗每 15 秒都会检查：过了强平时间还有持仓或挂单，就**反复重试**平仓，直到全部平掉；单个标的平仓失败不会影响其他标的。
+2. 进程在开盘期间退出（崩溃、Ctrl-C、行情连接出错）时，会先平掉所有仓位。
+3. 括号单的止损和止盈腿是**当日有效**的，收盘后就失效。所以要再用 cron 加一道和主进程**相互独立**的安全网：
+
+```cron
+CRON_TZ=America/New_York
+20 9 * * 1-5   cd /path/to/quant-daytrader && .venv/bin/python -m daytrader -c configs/orb.yaml -c configs/vwap.yaml -c configs/momo.yaml paper >> logs/cron.log 2>&1
+59 15 * * 1-5  cd /path/to/quant-daytrader && .venv/bin/python -m daytrader -c configs/orb.yaml -c configs/vwap.yaml -c configs/momo.yaml flatten >> logs/cron.log 2>&1
+```
+
+4. 回测中，到日终仍未平掉的仓位会按最后价格强制平仓（记为 `session_end`），绝不带到第二天。
+
+## 交易日历
+
+实盘和回测都使用 Alpaca 的交易日历：节假日不交易；半天交易日（13:00 收盘）把强平时间提前到收盘前 15 分钟，并忽略收盘后的 K 线。
 
 回测默认用 SIP 历史数据：Alpaca 免费套餐可以拿到 15 分钟以前的 SIP 数据。实盘默认用免费的 IEX 实时数据。
 

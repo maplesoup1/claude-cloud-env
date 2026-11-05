@@ -15,15 +15,16 @@ class _Bucket:
     low: float
     close: float
     volume: float
+    first_ts: datetime
 
     def to_bar(self, symbol: str) -> Bar:
-        return Bar(symbol, self.start, self.open, self.high, self.low, self.close, self.volume)
+        return Bar(symbol, self.start, self.open, self.high, self.low, self.close, self.volume, self.first_ts)
 
 
 class BarAggregator:
     def __init__(self, minutes: int):
-        if 60 % minutes:
-            raise ValueError("minutes must divide 60")
+        if minutes <= 0 or 30 % minutes:
+            raise ValueError("minutes must divide 30 (buckets must align with the 9:30 open)")
         self.minutes = minutes
         self._cur: dict[str, _Bucket] = {}
 
@@ -36,11 +37,13 @@ class BarAggregator:
         start = self._bucket_start(bar.ts)
         cur = self._cur.get(bar.symbol)
         if cur is not None and cur.start != start:
-            # A minute was missing at the end of the previous bucket: emit it now.
-            out.append(cur.to_bar(bar.symbol))
+            # The previous bucket's last minute(s) never came. Emit it late - unless it
+            # belongs to an earlier session (stale yesterday-close bar at today's open).
+            if cur.start.date() == start.date():
+                out.append(cur.to_bar(bar.symbol))
             cur = None
         if cur is None:
-            cur = _Bucket(start, bar.open, bar.high, bar.low, bar.close, bar.volume)
+            cur = _Bucket(start, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.ts)
         else:
             cur.high = max(cur.high, bar.high)
             cur.low = min(cur.low, bar.low)
