@@ -9,9 +9,10 @@ from pathlib import Path
 
 from .aggregator import BarAggregator
 from .broker.base import Broker
-from .models import Bar, Exit, Signal, is_regular_hours
+from .models import Bar, Exit, Signal
 from .notify import Notifier
 from .risk import RiskManager
+from .sessions import DEFAULT_CALENDAR, SessionCalendar
 from .strategy.base import Context, Strategy
 
 log = logging.getLogger(__name__)
@@ -27,8 +28,11 @@ class _NoPositions:
 class Engine:
     def __init__(self, strategy: Strategy, risk: RiskManager, broker: Broker, bar_minutes: int,
                  notifier: Notifier | None = None, journal_dir: str | Path | None = None,
-                 name: str = "default"):
+                 name: str = "default", calendar: SessionCalendar | None = None):
         self.name = name
+        self.calendar = calendar or risk.calendar or DEFAULT_CALENDAR
+        risk.calendar = self.calendar
+        self.bar_minutes = bar_minutes
         self.strategy = strategy
         self.risk = risk
         self.broker = broker
@@ -36,7 +40,7 @@ class Engine:
         self.notifier = notifier or Notifier()
         self.journal_dir = Path(journal_dir) if journal_dir else None
         self.lock = threading.RLock()
-        self._flattened_day: date | None = None
+        self._flatten_logged: date | None = None
         self.signals: list[dict] = []
         self.exits: list[dict] = []
         self._last_ts: dict[str, datetime] = {}
@@ -50,7 +54,7 @@ class Engine:
     # ---- events -----------------------------------------------------------
     def on_minute_bar(self, bar: Bar, trade: bool = True) -> None:
         """Process one completed 1-minute bar. `trade=False` = warm-up only."""
-        if not is_regular_hours(bar.ts):
+        if not self.calendar.in_session(bar.ts):
             return
         with self.lock:
             last = self._last_ts.get(bar.symbol)
@@ -60,36 +64,57 @@ class Engine:
             now = bar.ts + timedelta(minutes=1)  # the 1-minute bar is complete at its end
             if trade:
                 # Flatten/halt first so queued closes fill at this bar's open (sim).
-                self.broker.on_clock(bar.ts)
-                self.check_time_and_loss(bar.ts)
-                self.broker.on_minute_bar(bar)
+                # A broker/API failure here must not cost the strategy this bar.
+                try:
+                    self.broker.on_clock(bar.ts)
+                    self.check_time_and_loss(bar.ts)
+                    self.broker.on_minute_bar(bar)
+                except Exception:
+                    self.log.exception("broker/risk step failed on %s %s", bar.symbol, bar.ts)
             for b in self.agg.add(bar):
                 ctx = Context(self.broker if trade else _NoPositions(), now)
                 actions = self.strategy.on_bar(b, ctx) or []
                 if not trade:
                     continue
+                bar_end = b.ts + timedelta(minutes=self.bar_minutes)
                 for a in actions:
-                    if isinstance(a, Exit):
-                        self._exit(a, now)
-                    else:
-                        self._handle(a, now)
+                    try:
+                        if isinstance(a, Exit):
+                            self._exit(a, now)
+                        else:
+                            self._handle(a, now, bar_end)
+                    except Exception:
+                        self.log.exception("action failed: %s", a)
+                        self.notifier.send(f"[{self.name}] ERROR executing {a}; check the account")
 
     def check_time_and_loss(self, now: datetime) -> None:
-        """End-of-day flatten and daily-loss kill switch. Also called by the live watchdog."""
+        """EOD flatten and daily-loss halt. Called on every bar AND by the live watchdog,
+        and RETRIED on every call while anything is still open (a failed close must not
+        leave a position overnight)."""
         with self.lock:
-            if self.risk.past_flatten_time(now) and self._flattened_day != now.date():
-                self._flattened_day = now.date()
-                self.broker.flatten_all("eod")
-                self._event("flatten", reason="eod", ts=now)
             if not self.risk.is_halted(now) and self.risk.daily_loss_breached(self.broker):
                 self.risk.halt(now)
-                self.broker.flatten_all("daily_loss")
                 eq = self.broker.equity()
                 self._event("halt", reason="daily loss limit", equity=eq, ts=now)
                 self.notifier.send(f"[{self.name}] HALT: daily loss limit hit, equity={eq:.2f}")
+            eod = self.risk.past_flatten_time(now)
+            if not (eod or self.risk.is_halted(now)):
+                return
+            if not self.broker.busy_symbols():
+                return
+            reason = "eod" if eod else "daily_loss"
+            if self._flatten_logged != now.date():
+                self._flatten_logged = now.date()
+                self._event("flatten", reason=reason, ts=now)
+            try:
+                self.broker.flatten_all(reason)
+            except Exception as e:
+                self.log.exception("flatten failed; will retry")
+                self.notifier.send(f"[{self.name}] FLATTEN FAILED ({e}); retrying - check the account")
+                raise
 
-    def _handle(self, sig: Signal, now: datetime) -> None:
-        decision = self.risk.evaluate(sig, self.broker, now)
+    def _handle(self, sig: Signal, now: datetime, bar_end: datetime | None = None) -> None:
+        decision = self.risk.evaluate(sig, self.broker, now, bar_end)
         rec = {"strategy": self.name, "symbol": sig.symbol, "side": sig.side.value, "ref": sig.entry_ref,
                "stop": round(sig.stop, 4), "target": round(sig.target, 4), "qty": decision.qty,
                "decision": decision.reason, "ts": sig.ts}
