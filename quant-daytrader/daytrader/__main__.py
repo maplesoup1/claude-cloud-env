@@ -47,7 +47,9 @@ def main() -> None:
 
         from .strategy import REGISTRY
         for name, cls in sorted(REGISTRY.items()):
-            print(f"{name}: {(cls.__doc__ or cls.__module__).strip().splitlines()[0]}")
+            import sys
+            doc = cls.__doc__ or sys.modules[cls.__module__].__doc__ or cls.__module__
+            print(f"{name}: {doc.strip().splitlines()[0]}")
             for f in fields(cls.Params):
                 print(f"    {f.name} = {f.default!r}")
         return

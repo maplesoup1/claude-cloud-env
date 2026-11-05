@@ -34,6 +34,24 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+## 策略一览
+
+| 配置 | 策略 | 交易时段 | 思路 | 标的 |
+|---|---|---|---|---|
+| `configs/orb.yaml` | `orb` 开盘区间突破 | 9:45–11:30 | 动量：放量突破开盘 15 分钟区间，并且站在 VWAP 正确一侧 | 8 只大盘股和 ETF |
+| `configs/vwap.yaml` | `vwap_reversion` VWAP 均值回归 | 10:00–15:00 | 反转：价格偏离 VWAP 2σ、RSI 极端、出现反转K线，并过滤趋势日和大盘大跌（大涨） | 8 只低波动大盘股和 ETF |
+| `configs/momo.yaml` | `intraday_momentum` 尾盘动量 | 15:30–15:58 | 学术研究中的“日内动量”：前一日收盘到 15:30 的涨跌方向延续到收盘 | SPY、QQQ |
+| `configs/gap.yaml` | `gap_fade` 跳空回补（备选） | 9:45–11:30 | 1–4% 的跳空先失败（跌回开盘区间和 VWAP 另一侧），再做回补 | 14 只大盘个股 |
+
+**推荐同时跑 ORB + VWAP + 尾盘动量**：三者分别是早盘动量、午盘反转和尾盘动量，交易时段和逻辑都不同，相关性低。`gap_fade` 和 ORB 在跳空日经常对同一只股票同时发出同方向信号（独立审查测得约 15% 重叠），所以作为备选，或者换成与 ORB 不重叠的标的再用。
+
+```bash
+python -m daytrader -c configs/orb.yaml -c configs/vwap.yaml -c configs/momo.yaml backtest --start 2024-01-01 --end 2025-12-31 --slippage-bps 2 4 8
+python -m daytrader -c configs/orb.yaml -c configs/vwap.yaml -c configs/momo.yaml paper
+```
+
+> 合成数据只能用来验证代码流程是否跑通，不能说明策略是否赚钱：合成数据里人为加了趋势日，会偏向突破类策略、惩罚回归类策略。是否有优势只能看真实数据回测和模拟盘结果。
+
 ## 同时跑多个策略
 
 **推荐每个策略用一个独立的 Alpaca 模拟盘账户**（在 Alpaca 后台新建模拟盘账户，分别生成 key）。这样资金、持仓和单日亏损熔断互不影响，也能单独统计每个策略的绩效。在每个策略的配置文件里用 `account_env` 指定读取哪组 key：
