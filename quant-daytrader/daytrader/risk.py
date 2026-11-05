@@ -50,7 +50,9 @@ class RiskManager:
         by_gross = max(0.0, equity * self.cfg.max_gross_pct - gross_used) / sig.entry_ref
         return max(0, math.floor(min(by_risk, by_notional, by_gross)))
 
-    def evaluate(self, sig: Signal, broker: Broker, now: datetime, bar_end: datetime | None = None) -> Decision:
+    def evaluate(self, sig: Signal, broker: Broker, now: datetime, bar_end: datetime | None = None,
+                 pending_gross: float = 0.0) -> Decision:
+        """`pending_gross`: notional of entries submitted but not yet filled (counted in the cap)."""
         if self.is_halted(now):
             return Decision(0, "halted: daily loss limit")
         if self.past_flatten_time(now):
@@ -70,7 +72,7 @@ class RiskManager:
             return Decision(0, "max positions")
         if sig.side is Side.SHORT and not broker.can_short(sig.symbol):
             return Decision(0, "not shortable")
-        gross = sum(p.qty * p.entry_price for p in broker.positions().values())
+        gross = sum(p.qty * p.entry_price for p in broker.positions().values()) + pending_gross
         qty = self.size(sig, broker.equity(), gross)
         if qty <= 0:
             return Decision(0, "size is zero (risk/notional/gross limits)")
