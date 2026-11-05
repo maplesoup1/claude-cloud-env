@@ -1,0 +1,33 @@
+# Liquid names only: tight spreads matter more than anything else intraday.
+symbols: [SPY, QQQ, NVDA, TSLA, AAPL, AMD, META, MSFT]
+bar_minutes: 5
+
+strategy:
+  name: orb
+  range_minutes: 15        # opening range 9:30-9:45
+  volume_mult: 1.5
+  volume_lookback: 20
+  reward_risk: 2.0
+  stop_mode: range         # range | mid
+  max_stop_pct: 0.02
+  last_entry: "11:30"
+  allow_short: true
+  max_trades_per_symbol: 1
+
+risk:
+  risk_per_trade: 0.005    # 0.5% of equity per trade
+  max_position_pct: 0.25
+  max_positions: 3
+  daily_max_loss: 0.02     # -2% on the day -> flatten + stop for the day
+  flatten_at: "15:45"
+
+backtest:
+  start_equity: 30000
+  slippage_bps: 2.0
+  fee_per_share: 0.0
+  sec_fee_rate: 0.0000278
+
+live:
+  paper: true              # set false ONLY after weeks of paper trading
+  feed: iex                # free feed; "sip" needs a paid data plan
+  log_dir: logs

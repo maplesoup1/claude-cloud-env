@@ -6,3 +6,4 @@ Claude Code 云端会话的工作环境。
 - `.claude/hooks/session-start.sh`：云端会话启动时自动安装 [yt-dlp](https://github.com/yt-dlp/yt-dlp)。
 
 更新技能：重新从上游复制到 `.claude/skills/huashu-art-motion/`。
+- `quant-daytrader/`：美股日内量化交易框架（Alpaca 模拟盘），见其 README。
