@@ -37,7 +37,9 @@ def main() -> None:
 
     sub.add_parser("paper", help="trade today (paper unless live.paper=false)")
     sub.add_parser("status", help="show accounts, positions, open orders")
-    sub.add_parser("flatten", help="close each instance's own symbols (cron safety net)")
+    fl = sub.add_parser("flatten", help="close each instance's own symbols (cron safety net)")
+    fl.add_argument("--if-close-within", type=float, metavar="MIN",
+                    help="only act if the market closes within MIN minutes (half-day safe cron)")
     sub.add_parser("kill", help="cancel ALL orders and close ALL positions in each account NOW")
     sub.add_parser("list", help="list available strategies and their parameters")
 
@@ -91,7 +93,10 @@ def main() -> None:
     _setup_logging(cfgs[0].live.log_dir, args.verbose)
     from .live import flatten_instances, kill_switch, run_live, status
 
-    {"paper": run_live, "status": status, "kill": kill_switch, "flatten": flatten_instances}[args.cmd](cfgs)
+    if args.cmd == "flatten":
+        flatten_instances(cfgs, args.if_close_within)
+        return
+    {"paper": run_live, "status": status, "kill": kill_switch}[args.cmd](cfgs)
 
 
 if __name__ == "__main__":

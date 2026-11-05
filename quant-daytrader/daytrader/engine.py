@@ -28,7 +28,8 @@ class _NoPositions:
 class Engine:
     def __init__(self, strategy: Strategy, risk: RiskManager, broker: Broker, bar_minutes: int,
                  notifier: Notifier | None = None, journal_dir: str | Path | None = None,
-                 name: str = "default", calendar: SessionCalendar | None = None):
+                 name: str = "default", calendar: SessionCalendar | None = None,
+                 wall_clock=None, flatten_retry_seconds: float = 10.0):
         self.name = name
         self.calendar = calendar or risk.calendar or DEFAULT_CALENDAR
         risk.calendar = self.calendar
@@ -41,6 +42,11 @@ class Engine:
         self.journal_dir = Path(journal_dir) if journal_dir else None
         self.lock = threading.RLock()
         self._flatten_logged: date | None = None
+        self._last_flatten_try: datetime | None = None
+        self._last_fail_notice: datetime | None = None
+        self.flatten_retry = timedelta(seconds=flatten_retry_seconds)
+        self.wall_clock = wall_clock  # live: lambda: datetime.now(NY); decisions use the later of bar/wall time
+        self._recent_entries: dict[str, tuple[float, datetime]] = {}  # symbol -> (notional, submitted at)
         self.signals: list[dict] = []
         self.exits: list[dict] = []
         self._last_ts: dict[str, datetime] = {}
@@ -62,6 +68,8 @@ class Engine:
                 return  # duplicate / out-of-order (e.g. warm-up overlapping the stream)
             self._last_ts[bar.symbol] = bar.ts
             now = bar.ts + timedelta(minutes=1)  # the 1-minute bar is complete at its end
+            if self.wall_clock is not None:
+                now = max(now, self.wall_clock())  # live: a processing backlog makes signals stale
             if trade:
                 # Flatten/halt first so queued closes fill at this bar's open (sim).
                 # A broker/API failure here must not cost the strategy this bar.
@@ -87,34 +95,50 @@ class Engine:
                         self.log.exception("action failed: %s", a)
                         self.notifier.send(f"[{self.name}] ERROR executing {a}; check the account")
 
-    def check_time_and_loss(self, now: datetime) -> None:
+    def check_time_and_loss(self, now: datetime, lock_timeout: float = -1) -> None:
         """EOD flatten and daily-loss halt. Called on every bar AND by the live watchdog,
-        and RETRIED on every call while anything is still open (a failed close must not
-        leave a position overnight)."""
-        with self.lock:
-            if not self.risk.is_halted(now) and self.risk.daily_loss_breached(self.broker):
-                self.risk.halt(now)
-                eq = self.broker.equity()
-                self._event("halt", reason="daily loss limit", equity=eq, ts=now)
-                self.notifier.send(f"[{self.name}] HALT: daily loss limit hit, equity={eq:.2f}")
-            eod = self.risk.past_flatten_time(now)
-            if not (eod or self.risk.is_halted(now)):
-                return
-            if not self.broker.busy_symbols():
-                return
-            reason = "eod" if eod else "daily_loss"
-            if self._flatten_logged != now.date():
-                self._flatten_logged = now.date()
-                self._event("flatten", reason=reason, ts=now)
-            try:
-                self.broker.flatten_all(reason)
-            except Exception as e:
-                self.log.exception("flatten failed; will retry")
+        and retried (at most every `flatten_retry`) while anything is still open, so a
+        failed close never leaves a position overnight."""
+        if not self.lock.acquire(timeout=lock_timeout):
+            self.log.error("engine busy (lock held > %ss); skipping this check", lock_timeout)
+            return
+        try:
+            self._check_time_and_loss(now)
+        finally:
+            self.lock.release()
+
+    def _check_time_and_loss(self, now: datetime) -> None:
+        if not self.risk.is_halted(now) and self.risk.daily_loss_breached(self.broker):
+            self.risk.halt(now)
+            eq = self.broker.equity()
+            self._event("halt", reason="daily loss limit", equity=eq, ts=now)
+            self.notifier.send(f"[{self.name}] HALT: daily loss limit hit, equity={eq:.2f}")
+        eod = self.risk.past_flatten_time(now)
+        if not (eod or self.risk.is_halted(now)):
+            return
+        if self._last_flatten_try is not None and timedelta(0) <= now - self._last_flatten_try < self.flatten_retry:
+            return  # throttle: retry at most every flatten_retry
+        if not self.broker.busy_symbols():
+            return
+        self._last_flatten_try = now
+        reason = "eod" if eod else "daily_loss"
+        if self._flatten_logged != now.date():
+            self._flatten_logged = now.date()
+            self._event("flatten", reason=reason, ts=now)
+        try:
+            self.broker.flatten_all(reason)
+        except Exception as e:
+            self.log.exception("flatten failed; will retry")
+            if self._last_fail_notice is None or now - self._last_fail_notice >= timedelta(minutes=5):
+                self._last_fail_notice = now
                 self.notifier.send(f"[{self.name}] FLATTEN FAILED ({e}); retrying - check the account")
-                raise
+            raise
 
     def _handle(self, sig: Signal, now: datetime, bar_end: datetime | None = None) -> None:
-        decision = self.risk.evaluate(sig, self.broker, now, bar_end)
+        positions = self.broker.positions()
+        pending_gross = sum(n for sym, (n, t) in self._recent_entries.items()
+                            if sym not in positions and timedelta(0) <= now - t < timedelta(minutes=3))
+        decision = self.risk.evaluate(sig, self.broker, now, bar_end, pending_gross=pending_gross)
         rec = {"strategy": self.name, "symbol": sig.symbol, "side": sig.side.value, "ref": sig.entry_ref,
                "stop": round(sig.stop, 4), "target": round(sig.target, 4), "qty": decision.qty,
                "decision": decision.reason, "ts": sig.ts}
@@ -124,6 +148,8 @@ class Engine:
             return
         ok = self.broker.submit_bracket(sig.symbol, sig.side, decision.qty, sig.stop, sig.target,
                                         self.client_order_id(sig))
+        if ok:
+            self._recent_entries[sig.symbol] = (decision.qty * sig.entry_ref, now)
         self._event("order_submitted" if ok else "order_failed", **rec)
         if ok and self.notifier.enabled:
             self.notifier.send(f"[{self.name}] {sig.side.value.upper()} {decision.qty} {sig.symbol} "

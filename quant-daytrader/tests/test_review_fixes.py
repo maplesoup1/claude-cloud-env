@@ -157,3 +157,87 @@ def test_config_validation(tmp_path):
     with pytest.raises(ValueError, match="flatten_at"):
         load(text.replace('flatten_at: "15:45"', 'flatten_at: "16:00"'))
     assert load(text.replace('flatten_at: "15:45"', "flatten_at: 15:45")).risk.flatten_at == time(15, 45)
+
+
+# ---- second review round ---------------------------------------------------
+def test_flatten_retries_are_throttled():
+    b = FlakyBroker(fail_times=100)
+    eng = Engine(Scripted({}), RiskManager(RiskConfig(flatten_at=time(15, 45))), b, 5)
+    for i in range(20):                                  # 20 calls within 19 s
+        try:
+            eng.check_time_and_loss(at(15, 45) + timedelta(seconds=i))
+        except RuntimeError:
+            pass
+    assert b.calls == 2                                  # t=0 and t=10s
+
+
+def test_check_skips_when_engine_lock_is_held():
+    import threading
+    b = FlakyBroker(fail_times=0)
+    eng = Engine(Scripted({}), RiskManager(RiskConfig(flatten_at=time(15, 45))), b, 5)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hog():
+        with eng.lock:
+            held.set()
+            release.wait(5)
+    th = threading.Thread(target=hog)
+    th.start()
+    held.wait(5)
+    eng.check_time_and_loss(at(15, 46), lock_timeout=0.1)  # returns instead of blocking
+    assert b.calls == 0
+    release.set()
+    th.join()
+
+
+def test_gross_cap_counts_unfilled_entries():
+    """Three signals on the same bar: the second and third must see the first's notional."""
+    sigs = [Signal(s, Side.LONG, 100, 99, 103, at(9, 40)) for s in ("A", "B", "C")]
+    b = sim_broker(equity=10_000)
+    cfg = RiskConfig(max_gross_pct=1.0, max_position_pct=0.4, risk_per_trade=1, max_positions=5)
+    eng = Engine(Scripted({time(9, 40): sigs}), RiskManager(cfg), b, 5)
+    for m in range(40, 46):
+        for s in ("A", "B", "C"):
+            eng.on_minute_bar(flat(9, m, 100, sym=s))
+    gross = sum(p.qty * p.entry_price for p in b.positions().values())
+    assert gross <= 10_000 * 1.0 + 1e-6
+    assert [r["qty"] for r in eng.signals][:3] == [40, 40, 20]   # later repeats: symbol busy
+
+
+def test_live_backlog_makes_signal_stale():
+    sig = Signal("X", Side.LONG, 100, 98, 110, at(9, 40))
+    b = sim_broker()
+    eng = Engine(Scripted({time(9, 40): [sig]}), RiskManager(RiskConfig()), b, 5,
+                 wall_clock=lambda: at(9, 55))           # bar processed 10 minutes late
+    for m in range(30, 45):
+        eng.on_minute_bar(flat(9, m, 100))
+    assert eng.signals[0]["decision"] == "stale signal bar"
+
+
+def test_alpaca_close_not_resent_while_in_flight():
+    from daytrader.broker.alpaca import AlpacaBroker
+    b = AlpacaBroker.__new__(AlpacaBroker)
+    b.name, b.symbols, b._closing = "t", {"X"}, {}
+    b._invalidate = lambda: None
+    b.positions = lambda: {"X": Position("X", Side.LONG, 10, 100)}   # close has not filled yet
+    b.open_orders = lambda symbols=None: []
+    b._cancel_symbol_orders = lambda sym: None
+    calls = []
+    b.client = SimpleNamespace(close_position=lambda sym: calls.append(sym))
+    for _ in range(5):
+        b.close_position("X", "eod")
+    assert calls == ["X"]
+
+
+def test_http_timeout_is_applied():
+    from daytrader.broker.alpaca import with_timeout
+    seen = {}
+
+    class Sess:
+        def request(self, method, url, **kw):
+            seen.update(kw)
+    c = SimpleNamespace(_session=Sess())
+    with_timeout(c, 7)
+    c._session.request("GET", "u")
+    assert seen["timeout"] == 7
