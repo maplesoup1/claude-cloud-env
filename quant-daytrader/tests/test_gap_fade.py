@@ -92,3 +92,38 @@ def test_stop_too_wide_or_bad_rr(ctx):
     s2 = strat(min_rr=3)
     gap_up_open(s2, ctx)
     assert s2.on_bar(mk(9, 45, 101.8, 101.9, 101.3, 101.35), ctx) == []
+
+
+# ---- review findings --------------------------------------------------------
+def test_missing_930_minute_is_detected():
+    """The aggregated 5m bar starts at 9:30 even if the 9:30 minute was missing;
+    bar.first exposes the first minute actually seen."""
+    from daytrader.models import Bar
+    s = strat()
+    ctx = FakeCtx()
+    s.on_bar(mk(15, 55, 100, 100, 100, 100, day=PREV), ctx)
+    s.on_bar(Bar("X", at(9, 30), 102, 102.6, 101.8, 102.3, 1000, first_ts=at(9, 31)), ctx)
+    s.on_bar(mk(9, 35, 102.3, 102.5, 101.5, 101.7), ctx)
+    s.on_bar(mk(9, 40, 101.7, 102.0, 101.6, 101.9), ctx)
+    assert s.on_bar(mk(9, 45, 101.8, 101.9, 101.3, 101.35), ctx) == []
+
+
+def test_stale_prior_close_is_rejected(ctx):
+    s = strat()
+    s.on_bar(mk(15, 55, 100, 100, 100, 100, day=D - timedelta(days=8)), ctx)  # a week+ old
+    s.on_bar(mk(9, 30, 102.0, 102.6, 101.8, 102.3), ctx)
+    s.on_bar(mk(9, 35, 102.3, 102.5, 101.5, 101.7), ctx)
+    s.on_bar(mk(9, 40, 101.7, 102.0, 101.6, 101.9), ctx)
+    assert s.on_bar(mk(9, 45, 101.8, 101.9, 101.3, 101.35), ctx) == []
+    s2 = strat()                                                         # control: last Friday is fine
+    gap_up_open(s2, ctx)
+    assert s2.on_bar(mk(9, 45, 101.8, 101.9, 101.3, 101.35), ctx)
+
+
+def test_stop_at_least_min_atr_away(ctx):
+    s = strat(atr_period=2, min_stop_atr=1.0, min_rr=0.1, max_stop_pct=0.05)
+    gap_up_open(s, ctx)
+    [sig] = s.on_bar(mk(9, 45, 101.8, 101.9, 101.3, 101.35), ctx)
+    atr = s._atr["X"].value
+    assert sig.stop - sig.entry_ref >= atr - 1e-9
+    assert sig.stop >= s._sess["X"].vwap * 1.002 - 1e-9
