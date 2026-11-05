@@ -70,6 +70,11 @@ class SimBroker(Broker):
         self._pending[symbol] = _Order(symbol, side, qty, stop, target, client_order_id)
         return True
 
+    def close_position(self, symbol: str, reason: str) -> None:
+        self._pending.pop(symbol, None)
+        if symbol in self._positions:
+            self._to_close[symbol] = reason  # market order: fills at the next bar open
+
     def flatten_all(self, reason: str) -> None:
         self._pending.clear()
         for sym in self._positions:

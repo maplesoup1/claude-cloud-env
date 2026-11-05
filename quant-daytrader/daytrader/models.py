@@ -31,6 +31,8 @@ class Bar:
 
 @dataclass(frozen=True)
 class Signal:
+    """Entry request. Submitted as a bracket order (market entry + stop + take-profit)."""
+
     symbol: str
     side: Side
     entry_ref: float  # reference price (close of the signal bar)
@@ -38,6 +40,15 @@ class Signal:
     target: float
     ts: datetime  # start time of the signal bar
     tag: str = ""
+
+
+@dataclass(frozen=True)
+class Exit:
+    """Close the strategy's position in `symbol` at market (and cancel its orders)."""
+
+    symbol: str
+    reason: str
+    ts: datetime
 
 
 @dataclass

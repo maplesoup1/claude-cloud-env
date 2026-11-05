@@ -7,6 +7,9 @@ from ..models import Bar, Position, Side
 
 
 class Broker(ABC):
+    """One broker instance per strategy instance. Everything is scoped to that
+    strategy's symbols, so strategies sharing an account never touch each other."""
+
     @abstractmethod
     def equity(self) -> float: ...
 
@@ -25,8 +28,12 @@ class Broker(ABC):
                        client_order_id: str) -> bool: ...
 
     @abstractmethod
+    def close_position(self, symbol: str, reason: str) -> None:
+        """Cancel the symbol's working orders and close its position at market."""
+
+    @abstractmethod
     def flatten_all(self, reason: str) -> None:
-        """Cancel all working orders and close all positions at market."""
+        """close_position for every symbol this broker trades."""
 
     def can_short(self, symbol: str) -> bool:
         return True

@@ -38,6 +38,8 @@ class RiskManager:
         per_share = abs(sig.entry_ref - sig.stop)
         if per_share <= 0 or sig.entry_ref <= 0:
             return 0
+        if per_share / sig.entry_ref < self.cfg.min_stop_pct:
+            return 0
         by_risk = equity * self.cfg.risk_per_trade / per_share
         by_notional = equity * self.cfg.max_position_pct / sig.entry_ref
         return max(0, math.floor(min(by_risk, by_notional)))
@@ -52,6 +54,12 @@ class RiskManager:
             return Decision(0, "symbol already has position/order")
         if len(busy) >= self.cfg.max_positions:
             return Decision(0, "max positions")
+        long_ok = sig.stop < sig.entry_ref < sig.target
+        short_ok = sig.target < sig.entry_ref < sig.stop
+        if not (long_ok if sig.side is Side.LONG else short_ok):
+            return Decision(0, "stop/target on wrong side of entry")
+        if abs(sig.entry_ref - sig.stop) / sig.entry_ref < self.cfg.min_stop_pct:
+            return Decision(0, "stop too tight")
         if sig.side is Side.SHORT and not broker.can_short(sig.symbol):
             return Decision(0, "not shortable")
         qty = self.size(sig, broker.equity())

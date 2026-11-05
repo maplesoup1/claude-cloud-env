@@ -23,8 +23,8 @@ def _month_starts(start: date, end: date) -> Iterator[date]:
         d = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
 
 
-def fetch_alpaca_minutes(symbols: list[str], start: date, end: date, feed: str = "iex",
-                         cache_dir: str | Path = "data/cache") -> pd.DataFrame:
+def fetch_alpaca_minutes(symbols: list[str], start: date, end: date, feed: str = "sip",
+                         cache_dir: str | Path = "data/cache", account_env: str = "ALPACA") -> pd.DataFrame:
     """Download split-adjusted 1-minute bars, cached per symbol-month (current month is never cached)."""
     from alpaca.data.enums import Adjustment, DataFeed
     from alpaca.data.historical import StockHistoricalDataClient
@@ -33,7 +33,7 @@ def fetch_alpaca_minutes(symbols: list[str], start: date, end: date, feed: str =
 
     from .config import alpaca_keys
 
-    key, secret = alpaca_keys()
+    key, secret = alpaca_keys(account_env)
     client = StockHistoricalDataClient(key, secret)
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
@@ -51,6 +51,10 @@ def fetch_alpaca_minutes(symbols: list[str], start: date, end: date, feed: str =
             req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Minute,
                                    start=datetime.combine(m, time(), NY), end=datetime.combine(m_end, time(), NY),
                                    adjustment=Adjustment.SPLIT, feed=DataFeed(feed))
+            req_end = min(datetime.combine(m_end, time(), NY), datetime.now(NY) - timedelta(minutes=20))
+            if req_end <= datetime.combine(m, time(), NY):
+                continue
+            req = req.model_copy(update={"end": req_end})  # free plan: no SIP data from the last 15 min
             df = client.get_stock_bars(req).df
             if df.empty:
                 continue
@@ -69,7 +73,8 @@ def fetch_alpaca_minutes(symbols: list[str], start: date, end: date, feed: str =
 
 
 def synthetic_minutes(symbols: list[str], days: int = 60, seed: int = 7,
-                      start: date = date(2025, 1, 6), trend: float = 0.00012) -> pd.DataFrame:
+                      start: date = date(2025, 1, 6), trend: float = 0.00012,
+                      gap_sd: float = 0.006) -> pd.DataFrame:
     """Random-walk regular-hours minute bars with a U-shaped volume profile and
     occasional trend days. For testing the plumbing only - NOT for strategy research."""
     rng = np.random.default_rng(seed)
@@ -82,8 +87,9 @@ def synthetic_minutes(symbols: list[str], days: int = 60, seed: int = 7,
         for d in sessions:
             drift = rng.choice([0.0, 0.0, 0.0, 1.0, -1.0]) * trend
             rets = rng.normal(drift, 0.0009, 390)
-            closes = price * np.exp(np.cumsum(rets))
-            opens = np.concatenate([[price * (1 + rng.normal(0, 0.003))], closes[:-1]])
+            gap = rng.normal(0, gap_sd)
+            closes = price * (1 + gap) * np.exp(np.cumsum(rets))
+            opens = np.concatenate([[price * (1 + gap)], closes[:-1]])
             spread = np.abs(rng.normal(0, 0.0005, 390)) * closes
             highs = np.maximum(opens, closes) + spread
             lows = np.minimum(opens, closes) - spread

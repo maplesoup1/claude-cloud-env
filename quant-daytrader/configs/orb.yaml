@@ -1,0 +1,41 @@
+# Opening Range Breakout - morning momentum on liquid large caps.
+name: orb
+account_env: ALPACA_ORB        # .env: ALPACA_ORB_API_KEY / ALPACA_ORB_SECRET_KEY (its own paper account)
+symbols: [SPY, QQQ, NVDA, TSLA, AAPL, AMD, META, MSFT]
+bar_minutes: 5
+
+strategy:
+  name: orb
+  params:
+    range_minutes: 15          # opening range 9:30-9:45
+    volume_mult: 1.5
+    volume_lookback: 20
+    reward_risk: 2.0
+    stop_mode: range           # range | mid
+    min_range_pct: 0.002
+    max_range_pct: 0.02
+    vwap_filter: true
+    last_entry: "11:30"
+    allow_short: true
+    max_trades_per_symbol: 1
+    max_hold_minutes: 0
+
+risk:
+  risk_per_trade: 0.005        # 0.5% of equity per trade
+  max_position_pct: 0.25
+  max_positions: 3
+  daily_max_loss: 0.02         # -2% on the day -> flatten + stop for the day
+  flatten_at: "15:45"
+  min_stop_pct: 0.001
+
+backtest:
+  start_equity: 30000
+  slippage_bps: 2.0
+  fee_per_share: 0.0
+  sec_fee_rate: 0.0000278
+  feed: sip
+
+live:
+  paper: true                  # set false ONLY after weeks of paper trading
+  feed: iex                    # free real-time feed; "sip" needs a paid plan
+  log_dir: logs
